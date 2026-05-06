@@ -2,7 +2,7 @@ use crate::providers::{format_provider_error, post_json};
 use serde_json::Value;
 use std::env;
 
-pub fn complete(model: &str, messages: &[Value]) -> Result<String, String> {
+pub async fn complete(model: &str, messages: &[Value]) -> Result<String, String> {
     let api_key =
         env::var("DEEPSEEK_API_KEY").map_err(|_| "missing DEEPSEEK_API_KEY".to_owned())?;
     let base_url = env::var("AGENTOS_DEEPSEEK_BASE_URL")
@@ -22,7 +22,8 @@ pub fn complete(model: &str, messages: &[Value]) -> Result<String, String> {
             ("Content-Type", "application/json".to_owned()),
         ],
         &payload,
-    )?;
+    )
+    .await?;
     if let Some(error) = response.body.get("error") {
         return Err(format_provider_error("DeepSeek", &response, error));
     }

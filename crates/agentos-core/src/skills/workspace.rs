@@ -382,4 +382,3 @@ fn yaml_scalar(input: &str) -> String {
         format!("{:?}", input)
     }
 }
-

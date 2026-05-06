@@ -2,7 +2,7 @@ use crate::providers::post_json;
 use serde_json::Value;
 use std::env;
 
-pub fn complete(model: &str, messages: &[Value]) -> Result<String, String> {
+pub async fn complete(model: &str, messages: &[Value]) -> Result<String, String> {
     let api_key =
         env::var("ANTHROPIC_API_KEY").map_err(|_| "missing ANTHROPIC_API_KEY".to_owned())?;
     let base_url = env::var("AGENTOS_ANTHROPIC_BASE_URL")
@@ -27,7 +27,8 @@ pub fn complete(model: &str, messages: &[Value]) -> Result<String, String> {
             ("Content-Type", "application/json".to_owned()),
         ],
         &payload,
-    )?;
+    )
+    .await?;
     response
         .body
         .get("content")

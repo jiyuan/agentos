@@ -398,4 +398,3 @@ fn toml_de_error(err: toml::de::Error) -> CronError {
 fn toml_ser_error(err: toml::ser::Error) -> CronError {
     CronError::Storage(Arc::from(err.to_string()))
 }
-

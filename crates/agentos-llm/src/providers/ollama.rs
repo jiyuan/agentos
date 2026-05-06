@@ -2,7 +2,7 @@ use crate::providers::post_json;
 use serde_json::Value;
 use std::env;
 
-pub fn complete(model: &str, messages: &[Value]) -> Result<String, String> {
+pub async fn complete(model: &str, messages: &[Value]) -> Result<String, String> {
     let host = env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_owned());
     let payload = serde_json::json!({
         "model": model,
@@ -14,7 +14,8 @@ pub fn complete(model: &str, messages: &[Value]) -> Result<String, String> {
         &format!("{}/api/chat", host.trim_end_matches('/')),
         &[("Content-Type", "application/json".to_owned())],
         &payload,
-    )?;
+    )
+    .await?;
     response
         .body
         .get("message")

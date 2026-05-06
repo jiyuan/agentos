@@ -339,4 +339,3 @@ fn resource_index_from_tools(tools: &[ToolSpec]) -> ResourceIndex {
     }
     .sorted()
 }
-

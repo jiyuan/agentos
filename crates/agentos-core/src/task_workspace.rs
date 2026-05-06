@@ -217,4 +217,3 @@ fn timestamp() -> String {
         .map(|duration| duration.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_owned())
 }
-

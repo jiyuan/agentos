@@ -179,4 +179,3 @@ fn chat_id_string(chat: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
-

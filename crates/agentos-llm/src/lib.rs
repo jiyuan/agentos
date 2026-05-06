@@ -221,10 +221,10 @@ impl Llm for EnvLlm {
         validate_llm_selection(&selection).map_err(|err| LlmError::Provider(Arc::from(err)))?;
         let messages = messages.iter().map(chat_message).collect::<Vec<_>>();
         let content = match selection.provider.as_ref() {
-            "openai" => providers::openai::complete(&selection.model, &messages),
-            "anthropic" => providers::anthropic::complete(&selection.model, &messages),
-            "deepseek" => providers::deepseek::complete(&selection.model, &messages),
-            "ollama" => providers::ollama::complete(&selection.model, &messages),
+            "openai" => providers::openai::complete(&selection.model, &messages).await,
+            "anthropic" => providers::anthropic::complete(&selection.model, &messages).await,
+            "deepseek" => providers::deepseek::complete(&selection.model, &messages).await,
+            "ollama" => providers::ollama::complete(&selection.model, &messages).await,
             other => Err(format!("unknown LLM provider: {other}")),
         }
         .map_err(|err| LlmError::Provider(Arc::from(err)))?;
@@ -375,4 +375,3 @@ fn chat_message(message: &Message) -> serde_json::Value {
         "content": content
     })
 }
-

@@ -203,4 +203,3 @@ fn vector_row_id(record_id: &RecordId) -> i64 {
         row_id
     }
 }
-

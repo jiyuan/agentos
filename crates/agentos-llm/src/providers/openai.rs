@@ -2,7 +2,7 @@ use crate::providers::{first_env, format_openai_error, post_json};
 use serde_json::Value;
 use std::env;
 
-pub fn complete(model: &str, messages: &[Value]) -> Result<String, String> {
+pub async fn complete(model: &str, messages: &[Value]) -> Result<String, String> {
     let api_key = env::var("OPENAI_API_KEY").map_err(|_| "missing OPENAI_API_KEY".to_owned())?;
     let base_url = env::var("AGENTOS_OPENAI_BASE_URL")
         .or_else(|_| env::var("OPENAI_BASE_URL"))
@@ -27,7 +27,8 @@ pub fn complete(model: &str, messages: &[Value]) -> Result<String, String> {
         &format!("{}/chat/completions", base_url.trim_end_matches('/')),
         &headers,
         &payload,
-    )?;
+    )
+    .await?;
     if let Some(error) = response.body.get("error") {
         return Err(format_openai_error(&response, error));
     }

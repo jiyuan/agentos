@@ -149,4 +149,3 @@ pub(crate) fn stable_hash_u64(input: &str) -> u64 {
 pub(crate) fn memory_backend_error(message: impl Into<String>) -> MemoryError {
     MemoryError::Backend(Arc::from(message.into()))
 }
-

@@ -684,4 +684,3 @@ fn allow_tool_once(policy: &mut Policy, tool: Arc<str>) {
         });
     }
 }
-

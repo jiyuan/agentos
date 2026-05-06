@@ -132,4 +132,3 @@ fn contains_ssn_like(input: &str) -> bool {
             && window[10].is_ascii_digit()
     })
 }
-

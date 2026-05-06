@@ -1142,4 +1142,3 @@ fn unix_now() -> Result<u64, ChannelError> {
         .map(|duration| duration.as_secs())
         .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))
 }
-

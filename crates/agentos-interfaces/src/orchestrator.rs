@@ -233,4 +233,3 @@ pub trait Orchestrator: Send + Sync {
     /// loop can run guardrails and approval first.
     async fn plan(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError>;
 }
-

@@ -177,4 +177,3 @@ fn collapse_whitespace(input: impl AsRef<str>) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
-

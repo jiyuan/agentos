@@ -886,4 +886,3 @@ fn display_optional_path(path: &Option<PathBuf>) -> String {
     path.as_ref()
         .map_or_else(|| "<unset>".to_owned(), |path| path.display().to_string())
 }
-

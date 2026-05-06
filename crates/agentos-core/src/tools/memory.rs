@@ -536,4 +536,3 @@ fn metadata(start: Instant, bytes_out: u64) -> BTreeMap<Arc<str>, Value> {
     metadata.insert(Arc::from("bytes_out"), Value::from(bytes_out));
     metadata
 }
-
