@@ -106,16 +106,13 @@ impl MemoryManager {
                 },
             )
             .await?;
-        self.upsert_semantic_index(
-            &scope,
-            Record {
-                id: Some(id.clone()),
-                namespace: namespace.clone(),
-                body: body.clone(),
-                metadata: metadata.clone(),
-            },
-        )
-        .await;
+        let indexed_record = Record {
+            id: Some(id.clone()),
+            namespace: namespace.clone(),
+            body,
+            metadata,
+        };
+        self.upsert_semantic_index(&scope, &indexed_record).await;
         self.append_access_log(
             MemoryOperation::Write,
             Some(&id),
@@ -174,15 +171,13 @@ impl MemoryManager {
                 Some(&reason),
             )?;
         } else {
-            for record_id in &record_ids {
-                self.append_access_log(
-                    MemoryOperation::Read,
-                    Some(record_id),
-                    &namespace,
-                    caller,
-                    Some(&reason),
-                )?;
-            }
+            self.append_access_log_for_records(
+                MemoryOperation::Read,
+                &record_ids,
+                &namespace,
+                caller,
+                Some(&reason),
+            )?;
         }
         tracing::info!(
             operation = "managed_read",
@@ -557,15 +552,13 @@ impl MemoryManager {
                 Some(&reason),
             )?;
         } else {
-            for record_id in &removed_ids {
-                self.append_access_log(
-                    MemoryOperation::Forget,
-                    Some(record_id),
-                    &namespace,
-                    caller,
-                    Some(&reason),
-                )?;
-            }
+            self.append_access_log_for_records(
+                MemoryOperation::Forget,
+                &removed_ids,
+                &namespace,
+                caller,
+                Some(&reason),
+            )?;
         }
         tracing::info!(
             operation = "managed_forget",
@@ -611,11 +604,31 @@ impl MemoryManager {
         Ok(())
     }
 
-    async fn upsert_semantic_index(&self, scope: &MemoryScope, record: Record) {
+    fn append_access_log_for_records(
+        &self,
+        operation: MemoryOperation,
+        record_ids: &[RecordId],
+        namespace: &Namespace,
+        caller: &MemoryCaller,
+        reason: Option<&Arc<str>>,
+    ) -> Result<(), MemoryError> {
+        if let Some(accounting) = &self.accounting {
+            accounting.append_access_log_for_records(
+                operation.as_str(),
+                record_ids,
+                namespace,
+                caller,
+                reason.map(Arc::as_ref),
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn upsert_semantic_index(&self, scope: &MemoryScope, record: &Record) {
         let Some(index) = &self.semantic_index else {
             return;
         };
-        if let Err(err) = index.upsert(scope, &record).await {
+        if let Err(err) = index.upsert(scope, record).await {
             tracing::warn!(
                 operation = "semantic_index_upsert",
                 namespace = record.namespace.as_str(),

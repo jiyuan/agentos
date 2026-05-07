@@ -1,9 +1,11 @@
-use super::{record_matches_query, MemoryAccessLogEntry, MemoryAccounting, MemoryError};
+use super::{
+    record_matches_query, MemoryAccessLogEntry, MemoryAccounting, MemoryCaller, MemoryError,
+};
 use agentos_interfaces::memory::{Memory, Query, Record, Selector};
 use agentos_interfaces::session::{Item, Session, SessionError, Transcript};
 use agentos_proto::{ConversationId, Namespace, RecordId};
 use async_trait::async_trait;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -157,15 +159,19 @@ impl MemoryAccounting for SqliteStore {
         }
 
         let conn = self.memory_conn()?;
-        for record_id in record_ids {
-            conn.execute(
-                "UPDATE memory_records \
-                 SET last_accessed_at = CURRENT_TIMESTAMP, access_count = access_count + 1 \
-                 WHERE id = ?1",
-                params![record_id.as_str()],
-            )
-            .map_err(memory_sqlite_error)?;
-        }
+        let placeholders = std::iter::repeat_n("?", record_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE memory_records \
+             SET last_accessed_at = CURRENT_TIMESTAMP, access_count = access_count + 1 \
+             WHERE id IN ({placeholders})"
+        );
+        conn.execute(
+            &sql,
+            params_from_iter(record_ids.iter().map(RecordId::as_str)),
+        )
+        .map_err(memory_sqlite_error)?;
         Ok(())
     }
 
@@ -186,6 +192,44 @@ impl MemoryAccounting for SqliteStore {
             ],
         )
         .map_err(memory_sqlite_error)?;
+        Ok(())
+    }
+
+    fn append_access_log_for_records(
+        &self,
+        operation: &'static str,
+        record_ids: &[RecordId],
+        namespace: &Namespace,
+        caller: &MemoryCaller,
+        reason: Option<&str>,
+    ) -> Result<(), MemoryError> {
+        if record_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.memory_conn()?;
+        let tx = conn.transaction().map_err(memory_sqlite_error)?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO memory_access_log \
+                     (operation, record_id, namespace, caller_agent_id, caller_task_id, caller_conversation_id, reason) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(memory_sqlite_error)?;
+            for record_id in record_ids {
+                stmt.execute(params![
+                    operation,
+                    record_id.as_str(),
+                    namespace.as_str(),
+                    caller.agent_id.as_str(),
+                    caller.task_id.as_str(),
+                    caller.conversation_id.as_str(),
+                    reason,
+                ])
+                .map_err(memory_sqlite_error)?;
+            }
+        }
+        tx.commit().map_err(memory_sqlite_error)?;
         Ok(())
     }
 }
@@ -595,5 +639,113 @@ fn fts_match_query(input: &str) -> Option<String> {
         None
     } else {
         Some(terms.join(" AND "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentos_proto::{AgentId, TaskId};
+
+    fn caller() -> MemoryCaller {
+        MemoryCaller {
+            agent_id: AgentId::new("alice"),
+            task_id: TaskId::new("t1"),
+            conversation_id: ConversationId::new("c1"),
+            user_id: None,
+            allowed_shared_domains: Vec::new(),
+        }
+    }
+
+    fn seed_record(store: &SqliteStore, ns: &Namespace, id: &str) {
+        let conn = store.memory_conn().unwrap();
+        conn.execute(
+            "INSERT INTO memory_records (id, namespace, body_json, metadata_json, status) \
+             VALUES (?1, ?2, '{}', '{}', 'active')",
+            params![id, ns.as_str()],
+        )
+        .unwrap();
+    }
+
+    fn access_count(store: &SqliteStore, id: &str) -> i64 {
+        let conn = store.memory_conn().unwrap();
+        conn.query_row(
+            "SELECT access_count FROM memory_records WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    }
+
+    fn access_log_count(store: &SqliteStore, operation: &str) -> i64 {
+        let conn = store.memory_conn().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM memory_access_log WHERE operation = ?1",
+            params![operation],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn record_read_access_increments_each_record_in_one_statement() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let ns = Namespace::new("memory:test");
+        for id in ["a", "b", "c"] {
+            seed_record(&store, &ns, id);
+        }
+
+        let ids = ["a", "b", "c"]
+            .iter()
+            .map(|s| RecordId::new(*s))
+            .collect::<Vec<_>>();
+        store.record_read_access(&ids).unwrap();
+
+        for id in ["a", "b", "c"] {
+            assert_eq!(access_count(&store, id), 1, "first access counted for {id}");
+        }
+
+        store.record_read_access(&ids).unwrap();
+        for id in ["a", "b", "c"] {
+            assert_eq!(
+                access_count(&store, id),
+                2,
+                "second access counted for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_read_access_is_a_noop_for_empty_input() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.record_read_access(&[]).unwrap();
+    }
+
+    #[test]
+    fn append_access_log_for_records_writes_one_row_per_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let ns = Namespace::new("memory:test");
+        let caller = caller();
+        let ids = ["a", "b", "c", "d"]
+            .iter()
+            .map(|s| RecordId::new(*s))
+            .collect::<Vec<_>>();
+
+        store
+            .append_access_log_for_records("read", &ids, &ns, &caller, Some("hydrate"))
+            .unwrap();
+
+        assert_eq!(access_log_count(&store, "read"), 4);
+    }
+
+    #[test]
+    fn append_access_log_for_records_is_a_noop_for_empty_input() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let ns = Namespace::new("memory:test");
+        let caller = caller();
+        store
+            .append_access_log_for_records("read", &[], &ns, &caller, None)
+            .unwrap();
+        assert_eq!(access_log_count(&store, "read"), 0);
     }
 }

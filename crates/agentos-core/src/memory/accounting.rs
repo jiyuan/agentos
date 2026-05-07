@@ -21,6 +21,26 @@ impl MemoryOperation {
 pub(super) trait MemoryAccounting: Send + Sync {
     fn record_read_access(&self, record_ids: &[RecordId]) -> Result<(), MemoryError>;
     fn append_access_log(&self, entry: MemoryAccessLogEntry<'_>) -> Result<(), MemoryError>;
+
+    fn append_access_log_for_records(
+        &self,
+        operation: &'static str,
+        record_ids: &[RecordId],
+        namespace: &Namespace,
+        caller: &MemoryCaller,
+        reason: Option<&str>,
+    ) -> Result<(), MemoryError> {
+        for record_id in record_ids {
+            self.append_access_log(MemoryAccessLogEntry {
+                operation,
+                record_id: Some(record_id),
+                namespace,
+                caller,
+                reason,
+            })?;
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct MemoryAccessLogEntry<'a> {
