@@ -22,7 +22,8 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
@@ -698,7 +699,7 @@ fn unix_now() -> Result<u64, Box<dyn std::error::Error>> {
 struct TuiChannel {
     id: ChannelId,
     conversation_id: ConversationId,
-    orchestrator_strategy: Option<Arc<Mutex<OrchestratorStrategy>>>,
+    orchestrator_strategy: Option<Arc<AtomicU8>>,
     model_controller: Option<LlmModelController>,
 }
 
@@ -716,7 +717,7 @@ impl TuiChannel {
     fn new(
         id: ChannelId,
         conversation_id: ConversationId,
-        orchestrator_strategy: Option<Arc<Mutex<OrchestratorStrategy>>>,
+        orchestrator_strategy: Option<Arc<AtomicU8>>,
         model_controller: Option<LlmModelController>,
     ) -> Self {
         Self {
@@ -761,16 +762,14 @@ impl TuiChannel {
 
     fn set_orchestrator(&self, strategy: OrchestratorStrategy) {
         if let Some(current) = &self.orchestrator_strategy {
-            if let Ok(mut guard) = current.lock() {
-                *guard = strategy;
-            }
+            current.store(strategy as u8, Ordering::Relaxed);
         }
     }
 
     fn orchestrator_strategy(&self) -> OrchestratorStrategy {
         self.orchestrator_strategy
             .as_ref()
-            .and_then(|current| current.lock().ok().map(|guard| *guard))
+            .map(|current| OrchestratorStrategy::from_u8(current.load(Ordering::Relaxed)))
             .unwrap_or(OrchestratorStrategy::Max)
     }
 

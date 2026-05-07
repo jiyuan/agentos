@@ -1,5 +1,9 @@
-use super::{MemoryCaller, MemoryError};
+use super::scope::scope_component;
+use super::{MemoryCaller, MemoryError, MemoryScope};
 use agentos_proto::{Namespace, RecordId};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MemoryOperation {
@@ -41,6 +45,55 @@ pub(super) trait MemoryAccounting: Send + Sync {
         }
         Ok(())
     }
+}
+
+pub(super) fn managed_metadata(
+    caller: &MemoryCaller,
+    scope: &MemoryScope,
+    mut metadata: BTreeMap<Arc<str>, Value>,
+) -> BTreeMap<Arc<str>, Value> {
+    metadata.insert(
+        Arc::from("store"),
+        Value::String(scope.store.as_str().to_owned()),
+    );
+    metadata.insert(
+        Arc::from("owner_kind"),
+        Value::String(scope.owner.kind().to_owned()),
+    );
+    metadata.insert(
+        Arc::from("owner_id"),
+        Value::String(scope_component(scope.owner.id(), "global")),
+    );
+    metadata.insert(
+        Arc::from("visibility"),
+        Value::String(scope.visibility.as_str().to_owned()),
+    );
+    metadata.insert(Arc::from("domain"), Value::String(scope.domain_name()));
+    metadata.insert(
+        Arc::from("source_agent_id"),
+        Value::String(caller.agent_id.as_str().to_owned()),
+    );
+    metadata.insert(
+        Arc::from("source_task_id"),
+        Value::String(caller.task_id.as_str().to_owned()),
+    );
+    metadata.insert(
+        Arc::from("conversation_id"),
+        Value::String(caller.conversation_id.as_str().to_owned()),
+    );
+    metadata
+        .entry(Arc::from("importance"))
+        .or_insert_with(|| Value::from(0.0));
+    metadata
+        .entry(Arc::from("confidence"))
+        .or_insert_with(|| Value::from(1.0));
+    metadata
+        .entry(Arc::from("status"))
+        .or_insert_with(|| Value::String("active".to_owned()));
+    metadata
+        .entry(Arc::from("schema"))
+        .or_insert_with(|| Value::String("agentos.memory.v1".to_owned()));
+    metadata
 }
 
 pub(super) struct MemoryAccessLogEntry<'a> {

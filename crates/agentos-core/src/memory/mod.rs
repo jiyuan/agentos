@@ -6,24 +6,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 mod accounting;
+mod authorize;
 mod hybrid;
 mod in_memory;
 mod qdrant;
+mod query;
 mod reflection;
 mod scope;
 mod sqlite;
 mod sqlite_vec;
 
-use accounting::{MemoryAccessLogEntry, MemoryAccounting, MemoryOperation};
+use accounting::{managed_metadata, MemoryAccessLogEntry, MemoryAccounting, MemoryOperation};
+use authorize::{authorize_scope, hydration_scopes, unauthorized};
 use hybrid::reciprocal_rank_fusion;
 pub use hybrid::{SemanticIndex, SemanticSearchHit};
 pub use in_memory::{InMemoryMemory, InMemorySession};
 pub use qdrant::{QdrantSemanticConfig, QdrantSemanticIndex};
+use query::{estimate_fragment_tokens, selector_matches_record};
+pub(crate) use query::{record_is_active, record_matches_query};
 pub use reflection::{
     LexicalIndexReport, MemoryMaintenance, PromotionReport, ReflectionReport, ReflectionRequest,
     RetentionReport, RetentionRequest, StoreRetentionBudget,
 };
-pub(crate) use scope::scope_component;
 pub use scope::{
     EpisodeOutcome, EpisodeRecord, HydrationRequest, HydrationResult, HydrationStats, MemoryCaller,
     MemoryOwner, MemoryScope, MemoryStore, MemoryVisibility, RetrievalStrategy,
@@ -709,218 +713,4 @@ pub fn memory_caller_from_context(
         user_id,
         allowed_shared_domains,
     }
-}
-
-fn authorize_scope(
-    caller: &MemoryCaller,
-    scope: &MemoryScope,
-    operation: MemoryOperation,
-) -> Result<(), MemoryError> {
-    if scope.store == MemoryStore::Audit {
-        return Err(unauthorized("audit memory requires an administrative path"));
-    }
-
-    match &scope.owner {
-        MemoryOwner::User(user_id) => {
-            let caller_user = caller
-                .user_id
-                .as_deref()
-                .unwrap_or_else(|| caller.conversation_id.as_str());
-            if caller_user == user_id.as_ref() {
-                Ok(())
-            } else {
-                Err(unauthorized("user memory belongs to a different caller"))
-            }
-        }
-        MemoryOwner::Conversation(conversation_id) => {
-            if conversation_id == &caller.conversation_id {
-                Ok(())
-            } else {
-                Err(unauthorized(
-                    "conversation memory belongs to a different conversation",
-                ))
-            }
-        }
-        MemoryOwner::Agent(agent_id) => {
-            if scope.visibility == MemoryVisibility::Private && agent_id == &caller.agent_id {
-                Ok(())
-            } else {
-                Err(unauthorized("agent memory belongs to a different agent"))
-            }
-        }
-        MemoryOwner::Task(task_id) => {
-            if task_id == &caller.task_id {
-                Ok(())
-            } else {
-                Err(unauthorized("task memory belongs to a different task"))
-            }
-        }
-        MemoryOwner::Shared => {
-            let shared_read = matches!(operation, MemoryOperation::Read)
-                && scope.visibility != MemoryVisibility::Private;
-            if shared_read && shared_domain_allowed(caller, scope) {
-                Ok(())
-            } else {
-                Err(unauthorized(
-                    "shared memory is outside the caller's allowed domains",
-                ))
-            }
-        }
-    }
-}
-
-fn hydration_scopes(caller: &MemoryCaller, request: &HydrationRequest) -> Vec<MemoryScope> {
-    let stores = if request.stores.is_empty() {
-        vec![MemoryStore::Semantic]
-    } else {
-        request.stores.clone()
-    };
-    let domain = request.domain.clone();
-    let mut scopes = Vec::new();
-    for store in stores {
-        if let Some(user_id) = &caller.user_id {
-            scopes.push(MemoryScope::new(
-                store,
-                MemoryOwner::User(Arc::clone(user_id)),
-                MemoryVisibility::Private,
-                domain.clone(),
-            ));
-        }
-        scopes.push(MemoryScope::new(
-            store,
-            MemoryOwner::Conversation(caller.conversation_id.clone()),
-            MemoryVisibility::Private,
-            domain.clone(),
-        ));
-        scopes.push(MemoryScope::new(
-            store,
-            MemoryOwner::Agent(caller.agent_id.clone()),
-            MemoryVisibility::Private,
-            domain.clone(),
-        ));
-        scopes.push(MemoryScope::new(
-            store,
-            MemoryOwner::Task(caller.task_id.clone()),
-            MemoryVisibility::Private,
-            domain.clone(),
-        ));
-        for shared_domain in &caller.allowed_shared_domains {
-            scopes.push(MemoryScope::new(
-                store,
-                MemoryOwner::Shared,
-                MemoryVisibility::Shared,
-                Some(Arc::clone(shared_domain)),
-            ));
-        }
-    }
-    scopes
-}
-
-fn shared_domain_allowed(caller: &MemoryCaller, scope: &MemoryScope) -> bool {
-    let domain = scope.domain.as_deref().unwrap_or("general");
-    caller
-        .allowed_shared_domains
-        .iter()
-        .any(|allowed| allowed.as_ref() == domain)
-}
-
-fn unauthorized(message: &'static str) -> MemoryError {
-    MemoryError::Backend(Arc::from(format!("memory scope unauthorized: {message}")))
-}
-
-fn managed_metadata(
-    caller: &MemoryCaller,
-    scope: &MemoryScope,
-    mut metadata: BTreeMap<Arc<str>, Value>,
-) -> BTreeMap<Arc<str>, Value> {
-    metadata.insert(
-        Arc::from("store"),
-        Value::String(scope.store.as_str().to_owned()),
-    );
-    metadata.insert(
-        Arc::from("owner_kind"),
-        Value::String(scope.owner.kind().to_owned()),
-    );
-    metadata.insert(
-        Arc::from("owner_id"),
-        Value::String(scope_component(scope.owner.id(), "global")),
-    );
-    metadata.insert(
-        Arc::from("visibility"),
-        Value::String(scope.visibility.as_str().to_owned()),
-    );
-    metadata.insert(Arc::from("domain"), Value::String(scope.domain_name()));
-    metadata.insert(
-        Arc::from("source_agent_id"),
-        Value::String(caller.agent_id.as_str().to_owned()),
-    );
-    metadata.insert(
-        Arc::from("source_task_id"),
-        Value::String(caller.task_id.as_str().to_owned()),
-    );
-    metadata.insert(
-        Arc::from("conversation_id"),
-        Value::String(caller.conversation_id.as_str().to_owned()),
-    );
-    metadata
-        .entry(Arc::from("importance"))
-        .or_insert_with(|| Value::from(0.0));
-    metadata
-        .entry(Arc::from("confidence"))
-        .or_insert_with(|| Value::from(1.0));
-    metadata
-        .entry(Arc::from("status"))
-        .or_insert_with(|| Value::String("active".to_owned()));
-    metadata
-        .entry(Arc::from("schema"))
-        .or_insert_with(|| Value::String("agentos.memory.v1".to_owned()));
-    metadata
-}
-
-fn selector_matches_record(record: &Record, selector: &Selector) -> bool {
-    if let Some(id) = &selector.id {
-        return record.id.as_ref() == Some(id);
-    }
-    if let Some(namespace) = &selector.namespace {
-        return &record.namespace == namespace;
-    }
-    true
-}
-
-fn estimate_fragment_tokens(fragment: &MemoryFragment) -> usize {
-    let body_chars = fragment.body.to_string().chars().count();
-    let metadata_chars = serde_json::to_string(&fragment.metadata)
-        .map(|metadata| metadata.chars().count())
-        .unwrap_or(0);
-    (body_chars + metadata_chars).div_ceil(4).max(1)
-}
-
-fn record_matches_query(record: &Record, q: &Query) -> bool {
-    if !record_is_active(record) {
-        return false;
-    }
-    let Some(query) = q.lexical_text().map(str::trim) else {
-        return true;
-    };
-    if query.is_empty() {
-        return true;
-    }
-    let needle = query.to_ascii_lowercase();
-    record
-        .body
-        .to_string()
-        .to_ascii_lowercase()
-        .contains(&needle)
-        || serde_json::to_string(&record.metadata)
-            .map(|metadata| metadata.to_ascii_lowercase().contains(&needle))
-            .unwrap_or(false)
-}
-
-pub(crate) fn record_is_active(record: &Record) -> bool {
-    record
-        .metadata
-        .get("status")
-        .and_then(Value::as_str)
-        .map(|status| status == "active")
-        .unwrap_or(true)
 }

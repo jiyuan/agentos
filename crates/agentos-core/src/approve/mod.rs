@@ -132,8 +132,10 @@ impl Policy {
         }
 
         let tool_args = match plan {
-            Plan::CallTool(call) => serde_json::from_str::<Value>(call.args.get()).ok(),
-            Plan::Reply(_) | Plan::Handoff(_, _) | Plan::Delegate(_) | Plan::Escalate(_) => None,
+            Plan::CallTool(call) if self.tool_has_arg_constraints(&call.name) => {
+                serde_json::from_str::<Value>(call.args.get()).ok()
+            }
+            _ => None,
         };
 
         for rule in &self.rules {
@@ -143,6 +145,19 @@ impl Policy {
         }
 
         default_policy_decision(&self.default_decision, plan)
+    }
+
+    fn tool_has_arg_constraints(&self, tool_name: &Arc<str>) -> bool {
+        self.rules.iter().any(|rule| {
+            if rule.arg_equals.is_empty() {
+                return false;
+            }
+            match &rule.action {
+                PolicyAction::Any => true,
+                PolicyAction::Tool(name) => name == tool_name,
+                PolicyAction::Handoff | PolicyAction::Delegate | PolicyAction::Escalate => false,
+            }
+        })
     }
 
     pub fn narrow(parent: &Self, child: &Self) -> Result<Self, PolicyError> {
@@ -462,4 +477,99 @@ fn invalid_yaml(line: usize, message: impl Into<Arc<str>>) -> PolicyError {
 
 pub fn tool_call_approval_id(call: &ToolCall) -> Arc<str> {
     Arc::from(format!("approval-{}", call.id.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentos_proto::ToolCallId;
+    use serde_json::value::RawValue;
+
+    fn tool_call(name: &str, args_json: &str) -> Plan {
+        Plan::CallTool(ToolCall {
+            id: ToolCallId::new("call-1"),
+            name: Arc::from(name),
+            args: RawValue::from_string(args_json.to_owned()).expect("valid JSON"),
+        })
+    }
+
+    #[test]
+    fn tool_has_arg_constraints_returns_false_when_no_rule_constrains_args() {
+        let policy = Policy::allow_tools(["shell", "file"]);
+        assert!(!policy.tool_has_arg_constraints(&Arc::from("shell")));
+        assert!(!policy.tool_has_arg_constraints(&Arc::from("file")));
+    }
+
+    #[test]
+    fn tool_has_arg_constraints_only_matches_constrained_tool() {
+        let policy = Policy {
+            rules: vec![
+                PolicyRule {
+                    action: PolicyAction::Tool(Arc::from("shell")),
+                    decision: PolicyVerb::Allow,
+                    reason: None,
+                    arg_equals: BTreeMap::new(),
+                },
+                PolicyRule {
+                    action: PolicyAction::Tool(Arc::from("file")),
+                    decision: PolicyVerb::Allow,
+                    reason: None,
+                    arg_equals: BTreeMap::from([(Arc::from("operation"), Value::from("read"))]),
+                },
+            ],
+            default_decision: PolicyVerb::Deny,
+        };
+        assert!(!policy.tool_has_arg_constraints(&Arc::from("shell")));
+        assert!(policy.tool_has_arg_constraints(&Arc::from("file")));
+        assert!(!policy.tool_has_arg_constraints(&Arc::from("http")));
+    }
+
+    #[test]
+    fn tool_has_arg_constraints_handles_any_action() {
+        let policy = Policy {
+            rules: vec![PolicyRule {
+                action: PolicyAction::Any,
+                decision: PolicyVerb::Allow,
+                reason: None,
+                arg_equals: BTreeMap::from([(Arc::from("k"), Value::from("v"))]),
+            }],
+            default_decision: PolicyVerb::Deny,
+        };
+        assert!(policy.tool_has_arg_constraints(&Arc::from("anything")));
+    }
+
+    #[test]
+    fn decide_skips_arg_parse_when_no_rule_needs_args() {
+        let policy = Policy::allow_tools(["shell"]);
+        let plan = tool_call("shell", "{\"command\":\"ls\"}");
+        assert_eq!(policy.decide(&plan), PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn decide_matches_constrained_args() {
+        let policy = Policy::phase3_reference();
+        let allow = tool_call("file", "{\"operation\":\"read\"}");
+        assert_eq!(policy.decide(&allow), PolicyDecision::Allow);
+
+        let deny = tool_call("file", "{\"operation\":\"write\"}");
+        assert!(matches!(policy.decide(&deny), PolicyDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn orchestrator_strategy_round_trips_through_u8() {
+        use crate::runtime::OrchestratorStrategy;
+        assert_eq!(
+            OrchestratorStrategy::from_u8(OrchestratorStrategy::Max as u8),
+            OrchestratorStrategy::Max
+        );
+        assert_eq!(
+            OrchestratorStrategy::from_u8(OrchestratorStrategy::Min as u8),
+            OrchestratorStrategy::Min
+        );
+        assert_eq!(
+            OrchestratorStrategy::from_u8(255),
+            OrchestratorStrategy::Max,
+            "unknown bytes fall back to Max"
+        );
+    }
 }

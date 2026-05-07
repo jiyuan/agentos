@@ -24,8 +24,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -43,9 +43,10 @@ pub struct RuntimePaths {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
 pub enum OrchestratorStrategy {
-    Max,
-    Min,
+    Max = 0,
+    Min = 1,
 }
 
 impl OrchestratorStrategy {
@@ -72,10 +73,17 @@ impl OrchestratorStrategy {
             Self::Min => "min",
         }
     }
+
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Min,
+            _ => Self::Max,
+        }
+    }
 }
 
 pub struct StrategyOrchestrator {
-    strategy: Arc<Mutex<OrchestratorStrategy>>,
+    strategy: Arc<AtomicU8>,
     max: MaxOrchestrator,
     min: MinOrchestrator,
 }
@@ -83,21 +91,18 @@ pub struct StrategyOrchestrator {
 impl StrategyOrchestrator {
     pub fn new(strategy: OrchestratorStrategy, max: MaxOrchestrator, min: MinOrchestrator) -> Self {
         Self {
-            strategy: Arc::new(Mutex::new(strategy)),
+            strategy: Arc::new(AtomicU8::new(strategy as u8)),
             max,
             min,
         }
     }
 
-    pub fn strategy_handle(&self) -> Arc<Mutex<OrchestratorStrategy>> {
+    pub fn strategy_handle(&self) -> Arc<AtomicU8> {
         self.strategy.clone()
     }
 
     pub fn current_strategy(&self) -> OrchestratorStrategy {
-        self.strategy
-            .lock()
-            .map(|guard| *guard)
-            .unwrap_or(OrchestratorStrategy::Max)
+        OrchestratorStrategy::from_u8(self.strategy.load(Ordering::Relaxed))
     }
 
     pub fn describe_llm(&self) -> String {
