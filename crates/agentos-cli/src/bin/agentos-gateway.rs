@@ -1,4 +1,6 @@
+use agentos_cli::slash::{self, Parsed, SlashCommand, SlashContext};
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
+use agentos_core::crons::CronStore;
 use agentos_core::gateway::{GatewayRun, GatewayService};
 use agentos_core::runner::ResumeDecision;
 use agentos_core::runtime::{AgentRuntime, RuntimePaths};
@@ -491,6 +493,9 @@ where
     let deps =
         deps_scope.deps_with_guardrails(&input_guardrails, &output_guardrails, &tool_guardrails);
     let gateway_service = GatewayService::new(&deps, Arc::from(runtime.active_agent.as_str()));
+    let cron_store = CronStore::new(slash::cron_dir_path());
+    let orchestrator_handle = runtime.orchestrator.strategy_handle();
+    let model_controller = runtime.model_controller.clone();
     log_line(config, &format!("{channel_name} gateway loop started"))?;
 
     loop {
@@ -507,39 +512,85 @@ where
             thread::sleep(Duration::from_secs(1));
             continue;
         };
-        if is_clear_command(&input.message.content) {
-            let removed = runtime
-                .session
-                .clear_session(&input.conversation_id)
-                .map_err(|err| {
-                    format!("failed to clear {channel_name} conversation history: {err}")
-                })?;
-            log_line(
-                config,
-                &format!(
-                    "{channel_name} conversation {} cleared ({removed} items)",
-                    input.conversation_id.as_str()
-                ),
-            )?;
-            if let Err(send_err) = channel
-                .send(command_reply_envelope(
-                    &input,
-                    runtime.active_agent.as_str(),
-                    &format!(
-                        "Cleared {} conversation history ({removed} items).",
-                        channel_display_name(channel_name)
-                    ),
-                ))
-                .await
-            {
+        match slash::parse(&input.message.content) {
+            Parsed::Cmd(SlashCommand::Clear) => {
+                let removed = runtime
+                    .session
+                    .clear_session(&input.conversation_id)
+                    .map_err(|err| {
+                        format!("failed to clear {channel_name} conversation history: {err}")
+                    })?;
                 log_line(
                     config,
                     &format!(
-                        "{channel_name} gateway failed to send clear confirmation: {send_err}"
+                        "{channel_name} conversation {} cleared ({removed} items)",
+                        input.conversation_id.as_str()
                     ),
                 )?;
+                let reply = slash::format_clear(removed, channel_display_name(channel_name));
+                if let Err(send_err) = channel
+                    .send(command_reply_envelope(
+                        &input,
+                        runtime.active_agent.as_str(),
+                        &reply,
+                    ))
+                    .await
+                {
+                    log_line(
+                        config,
+                        &format!(
+                            "{channel_name} gateway failed to send clear confirmation: {send_err}"
+                        ),
+                    )?;
+                }
+                continue;
             }
-            continue;
+            Parsed::Cmd(cmd) => {
+                let ctx = SlashContext {
+                    skill_catalog: &runtime.skill_catalog,
+                    cron_store: &cron_store,
+                    tool_registry: deps.tools,
+                    memory_manager: runtime.memory_manager.as_ref(),
+                    orchestrator_handle: Some(&orchestrator_handle),
+                    model_controller: Some(&model_controller),
+                    agent_id: &runtime.active_agent,
+                    conversation_id: &input.conversation_id,
+                };
+                let reply = slash::render(cmd, &ctx).await;
+                if let Err(send_err) = channel
+                    .send(command_reply_envelope(
+                        &input,
+                        runtime.active_agent.as_str(),
+                        &reply,
+                    ))
+                    .await
+                {
+                    log_line(
+                        config,
+                        &format!("{channel_name} gateway failed to send slash reply: {send_err}"),
+                    )?;
+                }
+                continue;
+            }
+            Parsed::Usage(hint) => {
+                if let Err(send_err) = channel
+                    .send(command_reply_envelope(
+                        &input,
+                        runtime.active_agent.as_str(),
+                        &hint,
+                    ))
+                    .await
+                {
+                    log_line(
+                        config,
+                        &format!(
+                            "{channel_name} gateway failed to send slash usage hint: {send_err}"
+                        ),
+                    )?;
+                }
+                continue;
+            }
+            Parsed::NotSlash => {}
         }
         input.metadata.insert(
             Arc::from("task_id"),
@@ -718,18 +769,6 @@ fn command_reply_envelope(input: &Envelope, sender: &str, content: &str) -> Enve
         message: Message::text(MessageRole::Assistant, content),
         metadata: BTreeMap::new(),
     }
-}
-
-fn is_clear_command(content: &str) -> bool {
-    let trimmed = content.trim();
-    if trimmed.eq_ignore_ascii_case("clear") {
-        return true;
-    }
-    let Some(first_token) = trimmed.split_whitespace().next() else {
-        return false;
-    };
-    let command = first_token.split('@').next().unwrap_or(first_token);
-    command.eq_ignore_ascii_case("/clear")
 }
 
 fn user_facing_error_message(error: &str) -> String {
