@@ -1,14 +1,19 @@
 use agentos_interfaces::ChannelError;
 use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Maximum number of bytes drained from `openssl s_client`'s stderr when a
+/// failure occurs. Capped so a chatty subprocess can't balloon error messages.
+const STDERR_CAPTURE_LIMIT: u64 = 4 * 1024;
+
 pub(super) struct WebSocketConnection {
-    _child: Child,
+    child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    stderr: Option<ChildStderr>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,100 +38,138 @@ impl WebSocketConnection {
             .arg(&parsed.host)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            // Pipe stderr so handshake / TLS / DNS errors surface in the
+            // returned ChannelError instead of disappearing into /dev/null.
+            .stderr(Stdio::piped());
         if let Some(proxy) = &proxy {
             command.arg("-proxy").arg(proxy);
         }
         let mut child = command
             .spawn()
             .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| ChannelError::Backend(Arc::from("openssl stdin unavailable")))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ChannelError::Backend(Arc::from("openssl stdout unavailable")))?;
+        let mut stderr = child.stderr.take();
+        let mut stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                return Err(finalize_failure(
+                    &mut child,
+                    stderr.take(),
+                    "openssl stdin unavailable".to_owned(),
+                ))
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                return Err(finalize_failure(
+                    &mut child,
+                    stderr.take(),
+                    "openssl stdout unavailable".to_owned(),
+                ))
+            }
+        };
         let mut stdout = BufReader::new(stdout);
         let key = websocket_key()?;
-        write!(
+        if let Err(err) = write!(
             stdin,
             "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n",
             parsed.path_and_query, parsed.host, key
-        )
-        .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        stdin
-            .flush()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        ) {
+            return Err(finalize_failure(
+                &mut child,
+                stderr.take(),
+                format!("failed to write Feishu WebSocket upgrade request: {err}"),
+            ));
+        }
+        if let Err(err) = stdin.flush() {
+            return Err(finalize_failure(
+                &mut child,
+                stderr.take(),
+                format!("failed to flush Feishu WebSocket upgrade request: {err}"),
+            ));
+        }
 
         let mut status = String::new();
-        stdout
-            .read_line(&mut status)
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        if let Err(err) = stdout.read_line(&mut status) {
+            return Err(finalize_failure(
+                &mut child,
+                stderr.take(),
+                format!("failed to read Feishu WebSocket upgrade response: {err}"),
+            ));
+        }
         if !status.contains(" 101 ") {
-            return Err(ChannelError::Backend(Arc::from(format!(
-                "Feishu WebSocket upgrade failed: {}",
-                status.trim()
-            ))));
+            return Err(finalize_failure(
+                &mut child,
+                stderr.take(),
+                format!("Feishu WebSocket upgrade failed: {}", status.trim()),
+            ));
         }
         loop {
             let mut line = String::new();
-            stdout
-                .read_line(&mut line)
-                .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+            if let Err(err) = stdout.read_line(&mut line) {
+                return Err(finalize_failure(
+                    &mut child,
+                    stderr.take(),
+                    format!("failed to read Feishu WebSocket upgrade headers: {err}"),
+                ));
+            }
             if line == "\r\n" || line == "\n" || line.is_empty() {
                 break;
             }
         }
 
         Ok(Self {
-            _child: child,
+            child,
             stdin,
             stdout,
+            stderr,
         })
+    }
+
+    /// Convert a post-connect failure into a [`ChannelError`], killing the
+    /// openssl subprocess and appending whatever it last wrote to stderr.
+    fn fail(&mut self, primary: String) -> ChannelError {
+        finalize_failure(&mut self.child, self.stderr.take(), primary)
     }
 
     pub(super) fn read_frame(&mut self) -> Result<Vec<u8>, ChannelError> {
         loop {
             let mut header = [0_u8; 2];
-            self.stdout
-                .read_exact(&mut header)
-                .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+            if let Err(err) = self.stdout.read_exact(&mut header) {
+                return Err(self.fail(format!("Feishu WebSocket read header failed: {err}")));
+            }
             let opcode = header[0] & 0x0f;
             let masked = header[1] & 0x80 != 0;
             let mut len = u64::from(header[1] & 0x7f);
             if len == 126 {
                 let mut bytes = [0_u8; 2];
-                self.stdout
-                    .read_exact(&mut bytes)
-                    .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+                if let Err(err) = self.stdout.read_exact(&mut bytes) {
+                    return Err(self.fail(format!("Feishu WebSocket read length-16 failed: {err}")));
+                }
                 len = u64::from(u16::from_be_bytes(bytes));
             } else if len == 127 {
                 let mut bytes = [0_u8; 8];
-                self.stdout
-                    .read_exact(&mut bytes)
-                    .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+                if let Err(err) = self.stdout.read_exact(&mut bytes) {
+                    return Err(self.fail(format!("Feishu WebSocket read length-64 failed: {err}")));
+                }
                 len = u64::from_be_bytes(bytes);
             }
             let mask = if masked {
                 let mut mask = [0_u8; 4];
-                self.stdout
-                    .read_exact(&mut mask)
-                    .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+                if let Err(err) = self.stdout.read_exact(&mut mask) {
+                    return Err(self.fail(format!("Feishu WebSocket read mask failed: {err}")));
+                }
                 Some(mask)
             } else {
                 None
             };
             if len > 16 * 1024 * 1024 {
-                return Err(ChannelError::Backend(Arc::from(
-                    "Feishu WebSocket frame is too large",
-                )));
+                return Err(self.fail("Feishu WebSocket frame is too large".to_owned()));
             }
             let mut payload = vec![0_u8; len as usize];
-            self.stdout
-                .read_exact(&mut payload)
-                .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+            if let Err(err) = self.stdout.read_exact(&mut payload) {
+                return Err(self.fail(format!("Feishu WebSocket read payload failed: {err}")));
+            }
             if let Some(mask) = mask {
                 for (index, byte) in payload.iter_mut().enumerate() {
                     *byte ^= mask[index % 4];
@@ -135,9 +178,7 @@ impl WebSocketConnection {
             match opcode {
                 0x2 => return Ok(payload),
                 0x8 => {
-                    return Err(ChannelError::Backend(Arc::from(
-                        "Feishu WebSocket closed by server",
-                    )))
+                    return Err(self.fail("Feishu WebSocket closed by server".to_owned()));
                 }
                 0x9 => {
                     self.write_control_frame(0x0a, &payload)?;
@@ -173,11 +214,44 @@ impl WebSocketConnection {
         for (index, byte) in payload.iter().enumerate() {
             frame.push(byte ^ mask_key[index % 4]);
         }
-        self.stdin
+        if let Err(err) = self
+            .stdin
             .write_all(&frame)
             .and_then(|_| self.stdin.flush())
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))
+        {
+            return Err(self.fail(format!("Feishu WebSocket write failed: {err}")));
+        }
+        Ok(())
     }
+}
+
+/// Kill the openssl subprocess, drain whatever it last wrote to stderr (capped
+/// at [`STDERR_CAPTURE_LIMIT`] bytes), and fold that text into the returned
+/// error so operators see the actual TLS / DNS / cert failure instead of a
+/// bare upgrade message.
+fn finalize_failure(
+    child: &mut Child,
+    stderr: Option<ChildStderr>,
+    primary: String,
+) -> ChannelError {
+    let _ = child.kill();
+    let _ = child.wait();
+    let captured = drain_stderr(stderr);
+    let message = if captured.is_empty() {
+        primary
+    } else {
+        format!("{primary}\nopenssl stderr: {captured}")
+    };
+    ChannelError::Backend(Arc::from(message))
+}
+
+fn drain_stderr(handle: Option<ChildStderr>) -> String {
+    let Some(handle) = handle else {
+        return String::new();
+    };
+    let mut buf = Vec::new();
+    let _ = handle.take(STDERR_CAPTURE_LIMIT).read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).trim().to_owned()
 }
 
 impl ParsedWsUrl {
