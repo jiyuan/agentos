@@ -1,7 +1,8 @@
+use crate::crons::{CronSchedule, CronStore, CronTask};
 use crate::http::shared_client;
 use crate::skills::{create_skill, SkillCreation, SkillResourceKind};
 use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
-use agentos_proto::{ToolCall, ToolResult, ToolStatus};
+use agentos_proto::{ChannelId, ConversationId, ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, value::RawValue, Value};
@@ -9,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Default)]
 pub struct ShellTool;
@@ -356,6 +357,180 @@ impl Tool for SkillCreatorTool {
     }
 }
 
+/// Tool wrapping `crate::crons::CronStore::save_task` so sub-agents can
+/// register a recurring task end-to-end (TOML file written under
+/// `workspace/crons/<id>.toml`) inside the normal run-loop approval and
+/// guardrail flow.
+///
+/// The gateway's scheduler picks new files up from disk on its next polling
+/// cycle, so once this tool returns success the task is live without any
+/// daemon restart.
+#[derive(Default)]
+pub struct CronCreatorTool;
+
+#[derive(Debug, Deserialize)]
+struct CronCreateArgs {
+    /// Human-readable identifier, alphanumeric / `-` / `_` only. Used as the
+    /// on-disk filename and to dedupe scheduler entries.
+    id: String,
+    /// Channel that should receive the recurring envelope (e.g. "telegram",
+    /// "feishu"). Must match the registered `Channel::id()`.
+    channel_id: String,
+    /// Conversation id to deliver to (the user chat for Telegram, `oc_...`
+    /// for Feishu, etc).
+    conversation_id: String,
+    /// User-side prompt the scheduler will replay each tick.
+    prompt: String,
+    /// One of `interval_seconds`, `interval_hours`, or `interval_days` is
+    /// required.
+    #[serde(default)]
+    interval_seconds: Option<u64>,
+    #[serde(default)]
+    interval_hours: Option<u64>,
+    #[serde(default)]
+    interval_days: Option<u64>,
+    /// Unix timestamp of the first run. Defaults to `now + interval` so the
+    /// task fires after one full interval rather than immediately on
+    /// gateway restart.
+    #[serde(default)]
+    first_run_unix: Option<u64>,
+    /// Override the workspace cron directory. Defaults to `$AGENTOS_CRON_DIR`
+    /// or `workspace/crons`.
+    #[serde(default)]
+    root: Option<PathBuf>,
+}
+
+#[async_trait]
+impl Tool for CronCreatorTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: Arc::from("cron_create"),
+            description: Arc::from(
+                "Schedule a recurring AgentOS task. Persists a TOML file under \
+                 workspace/crons/<id>.toml; the gateway scheduler picks it up \
+                 on its next cycle and replays the supplied prompt at the \
+                 chosen interval. Use this whenever a user asks to schedule, \
+                 automate, or repeat a chat instruction.",
+            ),
+            input_schema: json!({
+                "type": "object",
+                "required": ["id", "channel_id", "conversation_id", "prompt"],
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Alphanumeric / -/_ identifier. Used as the filename and dedupe key."
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel to deliver to: telegram | feishu | tui."
+                    },
+                    "conversation_id": {
+                        "type": "string",
+                        "description": "Conversation id to deliver to (Telegram chat id, Feishu oc_..., etc)."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The user-side message the scheduler replays each tick."
+                    },
+                    "interval_seconds": { "type": "integer", "minimum": 1 },
+                    "interval_hours": { "type": "integer", "minimum": 1 },
+                    "interval_days": { "type": "integer", "minimum": 1 },
+                    "first_run_unix": {
+                        "type": "integer",
+                        "description": "Unix timestamp of the first run. Defaults to now + interval."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Override the workspace cron directory."
+                    }
+                }
+            }),
+            requires_isolation: false,
+        }
+    }
+
+    async fn call(&self, call: &ToolCall, args: &RawValue) -> Result<ToolResult, ToolError> {
+        let parsed: CronCreateArgs = serde_json::from_str(args.get())
+            .map_err(|err| ToolError::Failed(err.to_string().into()))?;
+        let start = Instant::now();
+
+        let interval_seconds = match (
+            parsed.interval_seconds,
+            parsed.interval_hours,
+            parsed.interval_days,
+        ) {
+            (Some(s), None, None) => s,
+            (None, Some(h), None) => h.checked_mul(3_600).ok_or_else(|| {
+                ToolError::Failed(Arc::from("interval_hours overflows u64 seconds"))
+            })?,
+            (None, None, Some(d)) => d.checked_mul(86_400).ok_or_else(|| {
+                ToolError::Failed(Arc::from("interval_days overflows u64 seconds"))
+            })?,
+            (None, None, None) => {
+                return Err(ToolError::Failed(Arc::from(
+                    "one of interval_seconds, interval_hours, or interval_days is required",
+                )));
+            }
+            _ => {
+                return Err(ToolError::Failed(Arc::from(
+                    "only one of interval_seconds, interval_hours, interval_days may be set",
+                )));
+            }
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
+        let next_due_unix = parsed
+            .first_run_unix
+            .unwrap_or_else(|| now.saturating_add(interval_seconds));
+
+        let schedule = CronSchedule::every_seconds(interval_seconds, next_due_unix)
+            .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
+
+        let task = CronTask::new(
+            parsed.id.as_str(),
+            ChannelId::new(parsed.channel_id.as_str()),
+            ConversationId::new(parsed.conversation_id.as_str()),
+            parsed.prompt.as_str(),
+            schedule,
+        );
+
+        let root = parsed.root.unwrap_or_else(default_cron_dir);
+        let store = CronStore::new(root.clone());
+        store
+            .save_task(&task)
+            .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
+
+        let path = store
+            .task_path(&task.id)
+            .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
+        let message = format!(
+            "created cron '{}' (every {}s, next at {next_due_unix}) at {}",
+            task.id,
+            interval_seconds,
+            path.display()
+        );
+        let bytes_out = message.len() as u64;
+        Ok(ToolResult {
+            call_id: call.id.clone(),
+            status: ToolStatus::Succeeded,
+            content: Arc::from(message),
+            metadata: result_metadata(elapsed_ms(start), bytes_out),
+        })
+    }
+}
+
+/// Resolve the on-disk root for cron task files, matching the convention used
+/// by `agentos-cli`: respect `$AGENTOS_CRON_DIR` if set, else fall back to
+/// `workspace/crons` relative to the gateway's cwd.
+fn default_cron_dir() -> PathBuf {
+    std::env::var_os("AGENTOS_CRON_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new("workspace").join("crons"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +571,108 @@ mod tests {
         assert!(body.contains("Smoke test for SkillCreatorTool."));
         assert!(tmp.join("test-skill").join("scripts").is_dir());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn unique_tmp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[tokio::test]
+    async fn cron_creator_tool_persists_task_file() {
+        let tmp = unique_tmp_dir("cron-creator-tool");
+        let args = json!({
+            "id": "daily-digest",
+            "channel_id": "telegram",
+            "conversation_id": "5480467472",
+            "prompt": "Summarize the day's notes.",
+            "interval_hours": 24,
+            "root": tmp.to_string_lossy(),
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let result = CronCreatorTool
+            .call(&tool_call("call_1"), &raw)
+            .await
+            .unwrap();
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        assert!(result.content.contains("daily-digest"));
+
+        let task_path = tmp.join("daily-digest.toml");
+        assert!(task_path.is_file());
+        let body = std::fs::read_to_string(&task_path).unwrap();
+        let task: CronTask = toml::from_str(&body).unwrap();
+        assert_eq!(task.id.as_ref(), "daily-digest");
+        assert_eq!(task.channel_id.as_str(), "telegram");
+        assert_eq!(task.conversation_id.as_str(), "5480467472");
+        assert_eq!(task.prompt.as_ref(), "Summarize the day's notes.");
+        assert_eq!(task.schedule.interval_seconds, 24 * 3600);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn cron_creator_tool_requires_an_interval() {
+        let tmp = unique_tmp_dir("cron-creator-no-interval");
+        let args = json!({
+            "id": "x",
+            "channel_id": "telegram",
+            "conversation_id": "1",
+            "prompt": "hi",
+            "root": tmp.to_string_lossy(),
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let err = CronCreatorTool
+            .call(&tool_call("call_2"), &raw)
+            .await
+            .unwrap_err();
+        let ToolError::Failed(msg) = err;
+        assert!(msg.contains("interval_seconds"));
+    }
+
+    #[tokio::test]
+    async fn cron_creator_tool_rejects_multiple_interval_fields() {
+        let tmp = unique_tmp_dir("cron-creator-many-intervals");
+        let args = json!({
+            "id": "x",
+            "channel_id": "telegram",
+            "conversation_id": "1",
+            "prompt": "hi",
+            "interval_hours": 1,
+            "interval_days": 1,
+            "root": tmp.to_string_lossy(),
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let err = CronCreatorTool
+            .call(&tool_call("call_3"), &raw)
+            .await
+            .unwrap_err();
+        let ToolError::Failed(msg) = err;
+        assert!(msg.contains("only one of"));
+    }
+
+    #[tokio::test]
+    async fn cron_creator_tool_rejects_invalid_id() {
+        let tmp = unique_tmp_dir("cron-creator-bad-id");
+        let args = json!({
+            "id": "has spaces!",
+            "channel_id": "telegram",
+            "conversation_id": "1",
+            "prompt": "hi",
+            "interval_seconds": 60,
+            "root": tmp.to_string_lossy(),
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let err = CronCreatorTool
+            .call(&tool_call("call_4"), &raw)
+            .await
+            .unwrap_err();
+        let ToolError::Failed(msg) = err;
+        assert!(msg.contains("invalid cron id"));
     }
 
     #[tokio::test]

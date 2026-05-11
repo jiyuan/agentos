@@ -11,8 +11,8 @@ use crate::skills::WorkspaceSkillCatalog;
 use crate::subagents::{SubAgentDefinition, SubAgentRegistry};
 use crate::task_workspace::TaskWorkspace;
 use crate::tools::{
-    FileTool, HttpTool, MemoryTool, ShellTool, SkillCreatorTool, StaticMcpClient, StaticMcpTool,
-    StdioMcpClient, ToolRegistry,
+    CronCreatorTool, FileTool, HttpTool, MemoryTool, ShellTool, SkillCreatorTool, StaticMcpClient,
+    StaticMcpTool, StdioMcpClient, ToolRegistry,
 };
 use agentos_interfaces::mcp::{McpClient, McpServer};
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
@@ -666,6 +666,7 @@ pub fn register_builtin_tool(tools: &mut ToolRegistry, name: &str) {
         "http" => tools.register(HttpTool),
         "file" => tools.register(FileTool),
         "skill_create" => tools.register(SkillCreatorTool),
+        "cron_create" => tools.register(CronCreatorTool),
         _ => {}
     }
 }
