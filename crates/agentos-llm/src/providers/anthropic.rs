@@ -87,14 +87,17 @@ fn build_message(message: &Message) -> Value {
         append_descriptors(&base_text, &owned)
     };
 
+    // Always lead with a text block. Some models reply with a generic
+    // "I don't have access to that file" when given an image content block
+    // alone; a neutral placeholder keeps the turn well-formed.
+    let text_part = if leading_text.is_empty() {
+        "(user attached files without a caption)".to_owned()
+    } else {
+        leading_text
+    };
     let mut blocks: Vec<Value> = Vec::with_capacity(inline_blocks.len() + 1);
-    if !leading_text.is_empty() {
-        blocks.push(json!({ "type": "text", "text": leading_text }));
-    }
+    blocks.push(json!({ "type": "text", "text": text_part }));
     blocks.extend(inline_blocks);
-    if blocks.is_empty() {
-        blocks.push(json!({ "type": "text", "text": "" }));
-    }
 
     json!({
         "role": role,
@@ -220,9 +223,11 @@ mod tests {
         };
         let value = build_message(&msg);
         let blocks = value.get("content").and_then(Value::as_array).unwrap();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0]["type"], "document");
-        assert_eq!(blocks[0]["source"]["media_type"], "application/pdf");
+        // Leading placeholder text block + document block.
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "document");
+        assert_eq!(blocks[1]["source"]["media_type"], "application/pdf");
     }
 
     #[test]

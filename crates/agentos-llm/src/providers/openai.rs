@@ -88,14 +88,19 @@ fn build_message(message: &Message) -> Value {
         append_descriptors(&base_text, &owned)
     };
 
+    // OpenAI vision models often reply with a generic "I don't have access
+    // to attached files" when an image content block arrives without any
+    // accompanying text block. Always lead with a text part — empty caption
+    // becomes a neutral placeholder so the model treats the image as part of
+    // a user turn rather than as a standalone, contextless payload.
+    let text_part = if leading_text.is_empty() {
+        "(user attached files without a caption)".to_owned()
+    } else {
+        leading_text
+    };
     let mut blocks: Vec<Value> = Vec::with_capacity(inline_blocks.len() + 1);
-    if !leading_text.is_empty() {
-        blocks.push(json!({ "type": "text", "text": leading_text }));
-    }
+    blocks.push(json!({ "type": "text", "text": text_part }));
     blocks.extend(inline_blocks);
-    if blocks.is_empty() {
-        blocks.push(json!({ "type": "text", "text": "" }));
-    }
 
     json!({
         "role": role,
@@ -164,10 +169,40 @@ mod tests {
         };
         let value = build_message(&msg);
         let blocks = value.get("content").and_then(Value::as_array).unwrap();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0]["type"], "image_url");
-        let url = blocks[0]["image_url"]["url"].as_str().unwrap();
+        assert_eq!(blocks.len(), 2);
+        // Empty caption gets replaced with a neutral placeholder so the model
+        // sees a well-formed turn (text + image) rather than image-only.
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("without a caption"));
+        assert_eq!(blocks[1]["type"], "image_url");
+        let url = blocks[1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn image_with_caption_uses_caption_as_text_block() {
+        let path = write_tmp("photo.jpg", &[0xff, 0xd8, 0xff]);
+        let msg = Message {
+            role: MessageRole::User,
+            content: Arc::from("what's in here?"),
+            attachments: vec![Attachment {
+                kind: AttachmentKind::Image,
+                name: Arc::from("photo.jpg"),
+                path,
+                mime: Some(Arc::from("image/jpeg")),
+                size: Some(3),
+                source: None,
+            }],
+            metadata: Default::default(),
+        };
+        let value = build_message(&msg);
+        let blocks = value.get("content").and_then(Value::as_array).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "what's in here?");
+        assert_eq!(blocks[1]["type"], "image_url");
     }
 
     #[test]
