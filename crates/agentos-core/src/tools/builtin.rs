@@ -368,7 +368,15 @@ impl Tool for SkillCreatorTool {
 #[derive(Default)]
 pub struct CronCreatorTool;
 
+/// Deserialised tool input.
+///
+/// Note: `root` (and the test-only override) is intentionally *not* exposed
+/// on the LLM-visible schema. The model picking its own cron directory is a
+/// foot-gun — it'll happily write to `workspace/` and then claim success.
+/// The runtime resolves the directory itself via `$AGENTOS_CRON_DIR` or the
+/// `workspace/crons` default.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CronCreateArgs {
     /// Human-readable identifier, alphanumeric / `-` / `_` only. Used as the
     /// on-disk filename and to dedupe scheduler entries.
@@ -389,15 +397,6 @@ struct CronCreateArgs {
     interval_hours: Option<u64>,
     #[serde(default)]
     interval_days: Option<u64>,
-    /// Unix timestamp of the first run. Defaults to `now + interval` so the
-    /// task fires after one full interval rather than immediately on
-    /// gateway restart.
-    #[serde(default)]
-    first_run_unix: Option<u64>,
-    /// Override the workspace cron directory. Defaults to `$AGENTOS_CRON_DIR`
-    /// or `workspace/crons`.
-    #[serde(default)]
-    root: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -434,15 +433,7 @@ impl Tool for CronCreatorTool {
                     },
                     "interval_seconds": { "type": "integer", "minimum": 1 },
                     "interval_hours": { "type": "integer", "minimum": 1 },
-                    "interval_days": { "type": "integer", "minimum": 1 },
-                    "first_run_unix": {
-                        "type": "integer",
-                        "description": "Unix timestamp of the first run. Defaults to now + interval."
-                    },
-                    "root": {
-                        "type": "string",
-                        "description": "Override the workspace cron directory."
-                    }
+                    "interval_days": { "type": "integer", "minimum": 1 }
                 }
             }),
             requires_isolation: false,
@@ -482,9 +473,11 @@ impl Tool for CronCreatorTool {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
-        let next_due_unix = parsed
-            .first_run_unix
-            .unwrap_or_else(|| now.saturating_add(interval_seconds));
+        // Always fire after one full interval — past timestamps would cause
+        // the scheduler to fire immediately on the next tick, which is
+        // surprising. Operators can edit the TOML by hand if they want a
+        // specific first-run wall-clock time.
+        let next_due_unix = now.saturating_add(interval_seconds);
 
         let schedule = CronSchedule::every_seconds(interval_seconds, next_due_unix)
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
@@ -497,8 +490,7 @@ impl Tool for CronCreatorTool {
             schedule,
         );
 
-        let root = parsed.root.unwrap_or_else(default_cron_dir);
-        let store = CronStore::new(root.clone());
+        let store = CronStore::new(cron_root_for_tests().unwrap_or_else(default_cron_dir));
         store
             .save_task(&task)
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
@@ -529,6 +521,24 @@ fn default_cron_dir() -> PathBuf {
     std::env::var_os("AGENTOS_CRON_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new("workspace").join("crons"))
+}
+
+/// In tests we redirect writes to a temp dir via this thread-local override;
+/// production code never sets it and the runtime falls through to
+/// [`default_cron_dir`].
+#[cfg(test)]
+thread_local! {
+    static TEST_CRON_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn cron_root_for_tests() -> Option<PathBuf> {
+    TEST_CRON_DIR.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(not(test))]
+fn cron_root_for_tests() -> Option<PathBuf> {
+    None
 }
 
 #[cfg(test)]
@@ -584,16 +594,39 @@ mod tests {
         ))
     }
 
+    /// RAII guard installing a thread-local cron directory override for the
+    /// duration of a single test, then restoring the prior value and cleaning
+    /// up the temp dir. Used because the tool no longer accepts `root` from
+    /// callers — the runtime resolves it itself.
+    struct CronDirGuard {
+        prior: Option<PathBuf>,
+        dir: PathBuf,
+    }
+
+    impl CronDirGuard {
+        fn new(prefix: &str) -> Self {
+            let dir = unique_tmp_dir(prefix);
+            let prior = TEST_CRON_DIR.with(|cell| cell.borrow_mut().replace(dir.clone()));
+            Self { prior, dir }
+        }
+    }
+
+    impl Drop for CronDirGuard {
+        fn drop(&mut self) {
+            TEST_CRON_DIR.with(|cell| *cell.borrow_mut() = self.prior.clone());
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     #[tokio::test]
     async fn cron_creator_tool_persists_task_file() {
-        let tmp = unique_tmp_dir("cron-creator-tool");
+        let guard = CronDirGuard::new("cron-creator-tool");
         let args = json!({
             "id": "daily-digest",
             "channel_id": "telegram",
             "conversation_id": "5480467472",
             "prompt": "Summarize the day's notes.",
             "interval_hours": 24,
-            "root": tmp.to_string_lossy(),
         });
         let raw = RawValue::from_string(args.to_string()).unwrap();
         let result = CronCreatorTool
@@ -603,7 +636,7 @@ mod tests {
         assert_eq!(result.status, ToolStatus::Succeeded);
         assert!(result.content.contains("daily-digest"));
 
-        let task_path = tmp.join("daily-digest.toml");
+        let task_path = guard.dir.join("daily-digest.toml");
         assert!(task_path.is_file());
         let body = std::fs::read_to_string(&task_path).unwrap();
         let task: CronTask = toml::from_str(&body).unwrap();
@@ -612,18 +645,40 @@ mod tests {
         assert_eq!(task.conversation_id.as_str(), "5480467472");
         assert_eq!(task.prompt.as_ref(), "Summarize the day's notes.");
         assert_eq!(task.schedule.interval_seconds, 24 * 3600);
-        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn cron_creator_tool_rejects_root_override_from_caller() {
+        // Regression: the model used to pass `root="workspace"` and have the
+        // file land outside `workspace/crons/`. The schema no longer exposes
+        // `root`, and `deny_unknown_fields` makes the attempt fail loudly
+        // instead of silently misdirecting writes.
+        let _guard = CronDirGuard::new("cron-creator-rooted");
+        let args = json!({
+            "id": "rooted",
+            "channel_id": "telegram",
+            "conversation_id": "1",
+            "prompt": "hi",
+            "interval_seconds": 60,
+            "root": "workspace",
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let err = CronCreatorTool
+            .call(&tool_call("call_root"), &raw)
+            .await
+            .unwrap_err();
+        let ToolError::Failed(msg) = err;
+        assert!(msg.contains("unknown field") && msg.contains("root"));
     }
 
     #[tokio::test]
     async fn cron_creator_tool_requires_an_interval() {
-        let tmp = unique_tmp_dir("cron-creator-no-interval");
+        let _guard = CronDirGuard::new("cron-creator-no-interval");
         let args = json!({
             "id": "x",
             "channel_id": "telegram",
             "conversation_id": "1",
             "prompt": "hi",
-            "root": tmp.to_string_lossy(),
         });
         let raw = RawValue::from_string(args.to_string()).unwrap();
         let err = CronCreatorTool
@@ -636,7 +691,7 @@ mod tests {
 
     #[tokio::test]
     async fn cron_creator_tool_rejects_multiple_interval_fields() {
-        let tmp = unique_tmp_dir("cron-creator-many-intervals");
+        let _guard = CronDirGuard::new("cron-creator-many-intervals");
         let args = json!({
             "id": "x",
             "channel_id": "telegram",
@@ -644,7 +699,6 @@ mod tests {
             "prompt": "hi",
             "interval_hours": 1,
             "interval_days": 1,
-            "root": tmp.to_string_lossy(),
         });
         let raw = RawValue::from_string(args.to_string()).unwrap();
         let err = CronCreatorTool
@@ -657,14 +711,13 @@ mod tests {
 
     #[tokio::test]
     async fn cron_creator_tool_rejects_invalid_id() {
-        let tmp = unique_tmp_dir("cron-creator-bad-id");
+        let _guard = CronDirGuard::new("cron-creator-bad-id");
         let args = json!({
             "id": "has spaces!",
             "channel_id": "telegram",
             "conversation_id": "1",
             "prompt": "hi",
             "interval_seconds": 60,
-            "root": tmp.to_string_lossy(),
         });
         let raw = RawValue::from_string(args.to_string()).unwrap();
         let err = CronCreatorTool
