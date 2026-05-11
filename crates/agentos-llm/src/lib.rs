@@ -4,6 +4,7 @@ pub mod env;
 pub mod providers;
 
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
+use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, MessageRole};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -42,7 +43,11 @@ pub trait Llm: Send + Sync {
 
     async fn complete(&self, ctx: &RunContext<'_>) -> Result<Message, LlmError>;
 
-    async fn complete_messages(&self, _messages: &[Message]) -> Result<Message, LlmError> {
+    async fn complete_messages(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+    ) -> Result<Message, LlmError> {
         Err(LlmError::Unconfigured(Arc::from("messages")))
     }
 }
@@ -211,23 +216,30 @@ impl Llm for EnvLlm {
             .iter()
             .map(|item| item.message.clone())
             .collect::<Vec<_>>();
-        self.complete_messages(&messages).await
+        self.complete_messages(&messages, &[]).await
     }
 
-    async fn complete_messages(&self, messages: &[Message]) -> Result<Message, LlmError> {
+    async fn complete_messages(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<Message, LlmError> {
         let Some(selection) = self.current_selection() else {
             return Err(LlmError::Unconfigured(Arc::from(self.tier.name())));
         };
         validate_llm_selection(&selection).map_err(|err| LlmError::Provider(Arc::from(err)))?;
-        let content = match selection.provider.as_ref() {
-            "openai" => providers::openai::complete(&selection.model, messages).await,
-            "anthropic" => providers::anthropic::complete(&selection.model, messages).await,
-            "deepseek" => providers::deepseek::complete(&selection.model, messages).await,
-            "ollama" => providers::ollama::complete(&selection.model, messages).await,
+        let message = match selection.provider.as_ref() {
+            "openai" => providers::openai::complete(&selection.model, messages, tools).await,
+            "anthropic" => providers::anthropic::complete(&selection.model, messages, tools).await,
+            "deepseek" => providers::deepseek::complete(&selection.model, messages, tools).await,
+            "ollama" => providers::ollama::complete(&selection.model, messages, tools).await,
             other => Err(format!("unknown LLM provider: {other}")),
         }
         .map_err(|err| LlmError::Provider(Arc::from(err)))?;
-        Ok(Message::text(MessageRole::Assistant, content))
+        // Belt-and-braces: providers may forget to set the role; force Assistant.
+        let mut message = message;
+        message.role = MessageRole::Assistant;
+        Ok(message)
     }
 }
 

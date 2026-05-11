@@ -388,6 +388,11 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
     let mut state = ctx.state;
     match ctx.plan {
         Plan::CallTool(call) => {
+            // Record the assistant turn that requested the tool *before*
+            // executing it. OpenAI/Anthropic/DeepSeek all 400 if a tool result
+            // arrives without a preceding assistant turn carrying that
+            // tool_call's id.
+            state.transcript.items.push(assistant_tool_call_item(&call));
             let result = execute_tool(&mut state, deps, call).await?;
             state.transcript.items.push(tool_result_item(&result));
         }
@@ -554,9 +559,35 @@ fn tool_result_item(result: &ToolResult) -> Item {
             role: MessageRole::Tool,
             content: Arc::clone(&result.content),
             attachments: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(result.call_id.clone()),
             metadata,
         },
         metadata: BTreeMap::new(),
+    }
+}
+
+fn assistant_tool_call_item(call: &ToolCall) -> Item {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(Arc::from("kind"), Value::String("tool_call".to_owned()));
+    metadata.insert(
+        Arc::from("tool_call_id"),
+        Value::String(call.id.as_str().to_owned()),
+    );
+    metadata.insert(
+        Arc::from("tool_name"),
+        Value::String(call.name.as_ref().to_owned()),
+    );
+    Item {
+        message: Message {
+            role: MessageRole::Assistant,
+            content: Arc::from(""),
+            attachments: Vec::new(),
+            tool_calls: vec![call.clone()],
+            tool_call_id: None,
+            metadata: BTreeMap::new(),
+        },
+        metadata,
     }
 }
 
@@ -583,6 +614,8 @@ fn subagent_result_item(result: &SubAgentRunOutput) -> Item {
             role: MessageRole::Tool,
             content: Arc::clone(&result.message.content),
             attachments: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
             metadata,
         },
         metadata: BTreeMap::new(),
@@ -624,6 +657,8 @@ fn suborchestrator_result_item(
             role: MessageRole::Tool,
             content: Arc::from(content),
             attachments: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
             metadata,
         },
         metadata: BTreeMap::new(),

@@ -3,11 +3,17 @@ use crate::providers::content::{
     read_text_document,
 };
 use crate::providers::post_json;
-use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole};
-use serde_json::{json, Value};
+use agentos_interfaces::tool::ToolSpec;
+use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole, ToolCall, ToolCallId};
+use serde_json::{json, value::RawValue, Value};
 use std::env;
+use std::sync::Arc;
 
-pub async fn complete(model: &str, messages: &[Message]) -> Result<String, String> {
+pub async fn complete(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolSpec],
+) -> Result<Message, String> {
     let api_key =
         env::var("ANTHROPIC_API_KEY").map_err(|_| "missing ANTHROPIC_API_KEY".to_owned())?;
     let base_url = env::var("AGENTOS_ANTHROPIC_BASE_URL")
@@ -20,11 +26,14 @@ pub async fn complete(model: &str, messages: &[Message]) -> Result<String, Strin
         .map(build_message)
         .collect::<Vec<_>>();
 
-    let payload = json!({
+    let mut payload = json!({
         "model": model,
         "max_tokens": 1024,
         "messages": serialized,
     });
+    if !tools.is_empty() {
+        payload["tools"] = json!(tools.iter().map(anthropic_tool_spec).collect::<Vec<_>>());
+    }
     let response = post_json(
         "llm",
         &format!("{}/messages", base_url.trim_end_matches('/')),
@@ -36,34 +45,116 @@ pub async fn complete(model: &str, messages: &[Message]) -> Result<String, Strin
         &payload,
     )
     .await?;
-    response
+    let content_blocks = response
         .body
         .get("content")
         .and_then(Value::as_array)
-        .and_then(|content| content.first())
-        .and_then(|part| part.get("text"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
         .ok_or_else(|| {
             format!(
                 "Anthropic response missing assistant content: {}",
                 response.body
             )
-        })
+        })?;
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for block in content_blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(chunk) = block.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(chunk);
+                }
+            }
+            Some("tool_use") => {
+                let Some(id) = block.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(name) = block.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let args_json = block.get("input").cloned().unwrap_or(json!({}));
+                let args_str = serde_json::to_string(&args_json).unwrap_or_else(|_| "{}".into());
+                if let Ok(args) = RawValue::from_string(args_str) {
+                    tool_calls.push(ToolCall {
+                        id: ToolCallId::new(id),
+                        name: Arc::from(name),
+                        args,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(Message {
+        role: MessageRole::Assistant,
+        content: Arc::from(text),
+        attachments: Vec::new(),
+        tool_calls,
+        tool_call_id: None,
+        metadata: Default::default(),
+    })
+}
+
+fn anthropic_tool_spec(spec: &ToolSpec) -> Value {
+    json!({
+        "name": spec.name.as_ref(),
+        "description": spec.description.as_ref(),
+        "input_schema": spec.input_schema,
+    })
 }
 
 fn build_message(message: &Message) -> Value {
+    // Anthropic encodes tool results as a `tool_result` content block inside
+    // a user turn (mirroring how `tool_use` lives in the assistant turn).
+    if message.role == MessageRole::Tool {
+        let tool_use_id = message
+            .tool_call_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned())
+            .unwrap_or_default();
+        return json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": message.content.as_ref(),
+            }],
+        });
+    }
+
+    // Assistant turn that requested tools: emit any text the model produced,
+    // followed by one `tool_use` block per pending call. Anthropic requires
+    // the turn that carries tool_use to precede the user turn carrying its
+    // matching tool_result.
+    if message.role == MessageRole::Assistant && !message.tool_calls.is_empty() {
+        let mut blocks: Vec<Value> = Vec::with_capacity(message.tool_calls.len() + 1);
+        if !message.content.is_empty() {
+            blocks.push(json!({ "type": "text", "text": message.content.as_ref() }));
+        }
+        for call in &message.tool_calls {
+            let input: Value = serde_json::from_str(call.args.get()).unwrap_or_else(|_| json!({}));
+            blocks.push(json!({
+                "type": "tool_use",
+                "id": call.id.as_str(),
+                "name": call.name.as_ref(),
+                "input": input,
+            }));
+        }
+        return json!({
+            "role": "assistant",
+            "content": blocks,
+        });
+    }
+
     let role = match message.role {
         MessageRole::Assistant => "assistant",
-        MessageRole::Tool | MessageRole::User => "user",
-        MessageRole::System => "user",
+        MessageRole::User => "user",
+        MessageRole::System | MessageRole::Tool => "user",
     };
 
-    let base_text = if message.role == MessageRole::Tool {
-        format!("Tool result: {}", message.content)
-    } else {
-        message.content.to_string()
-    };
+    let base_text = message.content.to_string();
 
     if message.attachments.is_empty() {
         return json!({
@@ -179,6 +270,8 @@ mod tests {
                 size: Some(3),
                 source: None,
             }],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
             metadata: Default::default(),
         }
     }
@@ -232,6 +325,8 @@ mod tests {
                 size: Some(13),
                 source: None,
             }],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
             metadata: Default::default(),
         };
         let value = build_message(&msg);
@@ -254,5 +349,66 @@ mod tests {
         let blocks = value.get("content").and_then(Value::as_array).unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], "text");
+    }
+
+    fn raw_args(s: &str) -> Box<RawValue> {
+        RawValue::from_string(s.to_owned()).unwrap()
+    }
+
+    #[test]
+    fn anthropic_tool_spec_uses_input_schema_field() {
+        let spec = ToolSpec {
+            name: Arc::from("file"),
+            description: Arc::from("read or write"),
+            input_schema: json!({"type":"object","properties":{}}),
+            requires_isolation: false,
+        };
+        let value = anthropic_tool_spec(&spec);
+        assert_eq!(value["name"], "file");
+        assert!(value["input_schema"].is_object());
+    }
+
+    #[test]
+    fn assistant_with_tool_calls_emits_tool_use_block() {
+        let msg = Message {
+            role: MessageRole::Assistant,
+            content: Arc::from("looking that up"),
+            attachments: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: ToolCallId::new("toolu_abc"),
+                name: Arc::from("file"),
+                args: raw_args(r#"{"operation":"read","path":"a.md"}"#),
+            }],
+            tool_call_id: None,
+            metadata: Default::default(),
+        };
+        let value = build_message(&msg);
+        assert_eq!(value["role"], "assistant");
+        let blocks = value["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "toolu_abc");
+        assert_eq!(blocks[1]["name"], "file");
+        assert_eq!(blocks[1]["input"]["operation"], "read");
+    }
+
+    #[test]
+    fn tool_role_emits_user_with_tool_result_block() {
+        let msg = Message {
+            role: MessageRole::Tool,
+            content: Arc::from("read 19 bytes"),
+            attachments: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(ToolCallId::new("toolu_abc")),
+            metadata: Default::default(),
+        };
+        let value = build_message(&msg);
+        assert_eq!(value["role"], "user");
+        let blocks = value["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "toolu_abc");
+        assert_eq!(blocks[0]["content"], "read 19 bytes");
     }
 }

@@ -178,7 +178,7 @@ impl MaxOrchestrator {
     ) -> Result<Option<&RoutingRule>, OrchestratorError> {
         let messages = routing_classifier_messages(input, &self.routing_table);
         let response = llm
-            .complete_messages(&messages)
+            .complete_messages(&messages, &[])
             .await
             .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
         let Some(decision) = parse_routing_decision(&response.content) else {

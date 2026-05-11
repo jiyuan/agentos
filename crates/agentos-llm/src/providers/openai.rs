@@ -3,11 +3,17 @@ use crate::providers::content::{
     read_text_document,
 };
 use crate::providers::{first_env, format_openai_error, post_json};
-use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole};
-use serde_json::{json, Value};
+use agentos_interfaces::tool::ToolSpec;
+use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole, ToolCall, ToolCallId};
+use serde_json::{json, value::RawValue, Value};
 use std::env;
+use std::sync::Arc;
 
-pub async fn complete(model: &str, messages: &[Message]) -> Result<String, String> {
+pub async fn complete(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolSpec],
+) -> Result<Message, String> {
     let api_key = env::var("OPENAI_API_KEY").map_err(|_| "missing OPENAI_API_KEY".to_owned())?;
     let base_url = env::var("AGENTOS_OPENAI_BASE_URL")
         .or_else(|_| env::var("OPENAI_BASE_URL"))
@@ -23,11 +29,16 @@ pub async fn complete(model: &str, messages: &[Message]) -> Result<String, Strin
         headers.push(("OpenAI-Project", project));
     }
     let serialized = messages.iter().map(build_message).collect::<Vec<_>>();
-    let payload = json!({
+    let mut payload = json!({
         "model": model,
         "messages": serialized,
         "temperature": 0.7,
     });
+    if !tools.is_empty() {
+        payload["tools"] = json!(tools.iter().map(tool_to_function).collect::<Vec<_>>());
+        // One call per turn — the loop iterates so we don't need parallelism.
+        payload["parallel_tool_calls"] = json!(false);
+    }
     let response = post_json(
         "llm",
         &format!("{}/chat/completions", base_url.trim_end_matches('/')),
@@ -38,35 +49,111 @@ pub async fn complete(model: &str, messages: &[Message]) -> Result<String, Strin
     if let Some(error) = response.body.get("error") {
         return Err(format_openai_error(&response, error));
     }
-    response
+    let message = response
         .body
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
+        .ok_or_else(|| format!("OpenAI response missing message: {}", response.body))?;
+    let content = message
+        .get("content")
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            format!(
-                "OpenAI response missing assistant content: {}",
-                response.body
-            )
+        .unwrap_or("")
+        .to_owned();
+    let tool_calls = parse_tool_calls(message);
+    Ok(Message {
+        role: MessageRole::Assistant,
+        content: Arc::from(content),
+        attachments: Vec::new(),
+        tool_calls,
+        tool_call_id: None,
+        metadata: Default::default(),
+    })
+}
+
+fn tool_to_function(spec: &ToolSpec) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": spec.name.as_ref(),
+            "description": spec.description.as_ref(),
+            "parameters": spec.input_schema,
+        }
+    })
+}
+
+fn parse_tool_calls(message: &Value) -> Vec<ToolCall> {
+    let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .filter_map(|call| {
+            let id = call.get("id").and_then(Value::as_str)?;
+            let function = call.get("function")?;
+            let name = function.get("name").and_then(Value::as_str)?;
+            let args_str = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            // Arguments come as a JSON string. Re-parse into RawValue so we
+            // can hand a canonical RawValue downstream without re-encoding.
+            let args = RawValue::from_string(args_str.to_owned()).ok()?;
+            Some(ToolCall {
+                id: ToolCallId::new(id),
+                name: Arc::from(name),
+                args,
+            })
         })
+        .collect()
 }
 
 fn build_message(message: &Message) -> Value {
+    // Tool result rides on a dedicated tool-role message that links back to
+    // the assistant's tool_calls entry by id. OpenAI 400s if you try to send
+    // tool results without a preceding assistant turn carrying that id.
+    if message.role == MessageRole::Tool {
+        let tool_call_id = message
+            .tool_call_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned())
+            .unwrap_or_default();
+        return json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": message.content.as_ref(),
+        });
+    }
+
     let role = match message.role {
         MessageRole::Assistant => "assistant",
         MessageRole::System => "system",
-        MessageRole::Tool | MessageRole::User => "user",
+        MessageRole::User => "user",
+        MessageRole::Tool => unreachable!("tool handled above"),
     };
 
-    let base_text = if message.role == MessageRole::Tool {
-        format!("Tool result: {}", message.content)
-    } else {
-        message.content.to_string()
-    };
+    // Assistant turns that requested tools: emit the canonical
+    // `tool_calls` field alongside whatever text the model also produced.
+    if message.role == MessageRole::Assistant && !message.tool_calls.is_empty() {
+        let calls = message
+            .tool_calls
+            .iter()
+            .map(serialize_tool_call)
+            .collect::<Vec<_>>();
+        let content: Value = if message.content.is_empty() {
+            Value::Null
+        } else {
+            Value::String(message.content.to_string())
+        };
+        return json!({
+            "role": role,
+            "content": content,
+            "tool_calls": calls,
+        });
+    }
+
+    let base_text = message.content.to_string();
 
     if message.attachments.is_empty() {
         return json!({
@@ -108,6 +195,17 @@ fn build_message(message: &Message) -> Value {
     json!({
         "role": role,
         "content": blocks,
+    })
+}
+
+fn serialize_tool_call(call: &ToolCall) -> Value {
+    json!({
+        "id": call.id.as_str(),
+        "type": "function",
+        "function": {
+            "name": call.name.as_ref(),
+            "arguments": call.args.get(),
+        }
     })
 }
 
@@ -193,13 +291,13 @@ mod tests {
                 size: Some(4),
                 source: None,
             }],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
             metadata: Default::default(),
         };
         let value = build_message(&msg);
         let blocks = value.get("content").and_then(Value::as_array).unwrap();
         assert_eq!(blocks.len(), 2);
-        // Empty caption gets replaced with a neutral placeholder so the model
-        // sees a well-formed turn (text + image) rather than image-only.
         assert_eq!(blocks[0]["type"], "text");
         assert!(blocks[0]["text"]
             .as_str()
@@ -224,6 +322,8 @@ mod tests {
                 size: Some(3),
                 source: None,
             }],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
             metadata: Default::default(),
         };
         let value = build_message(&msg);
@@ -247,6 +347,8 @@ mod tests {
                 size: Some(13),
                 source: None,
             }],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
             metadata: Default::default(),
         };
         let value = build_message(&msg);
@@ -273,6 +375,8 @@ mod tests {
                 size: Some(19),
                 source: None,
             }],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
             metadata: Default::default(),
         };
         let value = build_message(&msg);
@@ -300,6 +404,8 @@ mod tests {
                 size: Some(2048),
                 source: None,
             }],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
             metadata: Default::default(),
         };
         let value = build_message(&msg);
@@ -309,5 +415,81 @@ mod tests {
         let text = blocks[0]["text"].as_str().unwrap();
         assert!(text.contains("[attached document:"));
         assert!(text.contains("notes.docx"));
+    }
+
+    fn raw_args(s: &str) -> Box<RawValue> {
+        RawValue::from_string(s.to_owned()).unwrap()
+    }
+
+    #[test]
+    fn tool_spec_serializes_as_function_definition() {
+        let spec = ToolSpec {
+            name: Arc::from("file"),
+            description: Arc::from("read or write"),
+            input_schema: json!({"type":"object","properties":{}}),
+            requires_isolation: false,
+        };
+        let value = tool_to_function(&spec);
+        assert_eq!(value["type"], "function");
+        assert_eq!(value["function"]["name"], "file");
+        assert_eq!(value["function"]["description"], "read or write");
+    }
+
+    #[test]
+    fn assistant_with_tool_calls_serializes_tool_calls_field() {
+        let msg = Message {
+            role: MessageRole::Assistant,
+            content: Arc::from(""),
+            attachments: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: ToolCallId::new("call_1"),
+                name: Arc::from("file"),
+                args: raw_args(r#"{"operation":"write","path":"hi.txt"}"#),
+            }],
+            tool_call_id: None,
+            metadata: Default::default(),
+        };
+        let value = build_message(&msg);
+        assert_eq!(value["role"], "assistant");
+        let calls = value["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "file");
+    }
+
+    #[test]
+    fn tool_role_serializes_as_tool_message() {
+        let msg = Message {
+            role: MessageRole::Tool,
+            content: Arc::from("wrote 42 bytes"),
+            attachments: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(ToolCallId::new("call_1")),
+            metadata: Default::default(),
+        };
+        let value = build_message(&msg);
+        assert_eq!(value["role"], "tool");
+        assert_eq!(value["tool_call_id"], "call_1");
+        assert_eq!(value["content"], "wrote 42 bytes");
+    }
+
+    #[test]
+    fn parse_tool_calls_extracts_function_calls() {
+        let response = json!({
+            "tool_calls": [{
+                "id": "call_abc",
+                "type": "function",
+                "function": {
+                    "name": "file",
+                    "arguments": "{\"operation\":\"write\",\"path\":\"a.txt\"}"
+                }
+            }]
+        });
+        let calls = parse_tool_calls(&response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_str(), "call_abc");
+        assert_eq!(calls[0].name.as_ref(), "file");
+        assert!(calls[0].args.get().contains("\"operation\":\"write\""));
     }
 }

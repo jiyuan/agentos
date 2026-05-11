@@ -198,7 +198,7 @@ impl AgentRuntime {
                 memory_manager.clone(),
                 workspace_config.memory.hydration_settings()?,
             );
-        let min_orchestrator = MinOrchestrator::new(high_llm);
+        let min_orchestrator = MinOrchestrator::new(high_llm).with_tools(tools.specs());
         let orchestrator_strategy =
             OrchestratorStrategy::from_config(&workspace_config.agent.orchestrator)?;
         let orchestrator =
@@ -461,10 +461,14 @@ pub fn build_subagents(
         if subagent_memory_tool_enabled(subagent) {
             tools.register(MemoryTool::with_manager(memory_manager.clone()));
         }
+        // Capture the tool specs *before* moving `tools` into the definition,
+        // so we can hand them to the orchestrator (which surfaces them as the
+        // LLM's `tools` schema for function calling).
+        let tool_specs = tools.specs();
         let mut definition = SubAgentDefinition::new(
             AgentId::new(Arc::clone(&subagent.id)),
             Arc::clone(&subagent.policy_id),
-            subagent_orchestrator(subagent, models.clone())?,
+            subagent_orchestrator(subagent, models.clone(), tool_specs)?,
             subagent_policy(subagent)?,
         )
         .with_tools(Arc::new(tools))
@@ -660,18 +664,19 @@ pub fn register_builtin_tool(tools: &mut ToolRegistry, name: &str) {
 fn subagent_orchestrator(
     subagent: &SubAgentConfig,
     models: LlmModelController,
+    tool_specs: Vec<agentos_interfaces::tool::ToolSpec>,
 ) -> Result<Arc<dyn Orchestrator>, String> {
     let tier = LlmModelTier::from_config(&subagent.model_tier)?;
     match subagent.orchestrator.as_ref() {
         "builtin.echo" => Ok(Arc::new(EchoOrchestrator)),
         "builtin.min" | "builtin.llm" | "builtin.llm_fallback" => Ok(Arc::new(
-            MinOrchestrator::new(Arc::new(EnvLlm::new(tier, models)?)),
+            MinOrchestrator::new(Arc::new(EnvLlm::new(tier, models)?)).with_tools(tool_specs),
         )),
         "builtin.max" | "builtin.tool_selecting" => Ok(Arc::new(
-            MaxOrchestrator::new().with_llm(Arc::new(EnvLlm::new(tier, models)?)),
+            MaxOrchestrator::with_tools(tool_specs).with_llm(Arc::new(EnvLlm::new(tier, models)?)),
         )),
         _ => Ok(Arc::new(
-            MaxOrchestrator::new().with_llm(Arc::new(EnvLlm::new(tier, models)?)),
+            MaxOrchestrator::with_tools(tool_specs).with_llm(Arc::new(EnvLlm::new(tier, models)?)),
         )),
     }
 }

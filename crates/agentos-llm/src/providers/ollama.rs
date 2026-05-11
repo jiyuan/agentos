@@ -1,17 +1,28 @@
 use crate::providers::content::append_descriptors;
 use crate::providers::post_json;
-use agentos_proto::{Message, MessageRole};
-use serde_json::{json, Value};
+use agentos_interfaces::tool::ToolSpec;
+use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
+use serde_json::{json, value::RawValue, Value};
 use std::env;
+use std::sync::Arc;
 
-pub async fn complete(model: &str, messages: &[Message]) -> Result<String, String> {
+pub async fn complete(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolSpec],
+) -> Result<Message, String> {
     let host = env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_owned());
     let serialized = messages.iter().map(flat_message).collect::<Vec<_>>();
-    let payload = json!({
+    let mut payload = json!({
         "model": model,
         "messages": serialized,
         "stream": false
     });
+    if !tools.is_empty() {
+        // Ollama's tools support is model-dependent. Pass them through;
+        // models that don't support tools simply ignore the field.
+        payload["tools"] = json!(tools.iter().map(tool_to_function).collect::<Vec<_>>());
+    }
     let response = post_json(
         "llm",
         &format!("{}/api/chat", host.trim_end_matches('/')),
@@ -19,31 +30,109 @@ pub async fn complete(model: &str, messages: &[Message]) -> Result<String, Strin
         &payload,
     )
     .await?;
-    response
+    let message_value = response
         .body
         .get("message")
-        .and_then(|message| message.get("content"))
+        .ok_or_else(|| format!("Ollama response missing message: {}", response.body))?;
+    let content = message_value
+        .get("content")
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            format!(
-                "Ollama response missing assistant content: {}",
-                response.body
-            )
+        .unwrap_or("")
+        .to_owned();
+    let tool_calls = parse_tool_calls(message_value);
+    Ok(Message {
+        role: MessageRole::Assistant,
+        content: Arc::from(content),
+        attachments: Vec::new(),
+        tool_calls,
+        tool_call_id: None,
+        metadata: Default::default(),
+    })
+}
+
+fn tool_to_function(spec: &ToolSpec) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": spec.name.as_ref(),
+            "description": spec.description.as_ref(),
+            "parameters": spec.input_schema,
+        }
+    })
+}
+
+fn parse_tool_calls(message: &Value) -> Vec<ToolCall> {
+    let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .filter_map(|call| {
+            let function = call.get("function")?;
+            let name = function.get("name").and_then(Value::as_str)?;
+            // Ollama returns `function.arguments` as a JSON object directly,
+            // not a string. Normalise to a JSON-encoded string so it round-trips
+            // identically to OpenAI/DeepSeek through the rest of the pipeline.
+            let args_json = function.get("arguments").cloned().unwrap_or(json!({}));
+            let args_str = serde_json::to_string(&args_json).ok()?;
+            let args = RawValue::from_string(args_str).ok()?;
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("ollama-{name}"));
+            Some(ToolCall {
+                id: ToolCallId::new(id),
+                name: Arc::from(name),
+                args,
+            })
         })
+        .collect()
 }
 
 fn flat_message(message: &Message) -> Value {
+    if message.role == MessageRole::Tool {
+        // Ollama accepts a "tool" role for results; the tool_call_id pairs it
+        // with the assistant's preceding tool_calls.
+        let tool_call_id = message
+            .tool_call_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned())
+            .unwrap_or_default();
+        return json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": message.content.as_ref(),
+        });
+    }
+    if message.role == MessageRole::Assistant && !message.tool_calls.is_empty() {
+        let calls = message
+            .tool_calls
+            .iter()
+            .map(|call| {
+                let args_value: Value =
+                    serde_json::from_str(call.args.get()).unwrap_or_else(|_| json!({}));
+                json!({
+                    "function": {
+                        "name": call.name.as_ref(),
+                        "arguments": args_value,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        return json!({
+            "role": "assistant",
+            "content": message.content.as_ref(),
+            "tool_calls": calls,
+        });
+    }
     let role = match message.role {
         MessageRole::Assistant => "assistant",
         MessageRole::System => "system",
-        MessageRole::Tool | MessageRole::User => "user",
+        MessageRole::User => "user",
+        MessageRole::Tool => unreachable!("tool handled above"),
     };
-    let base = if message.role == MessageRole::Tool {
-        format!("Tool result: {}", message.content)
-    } else {
-        message.content.to_string()
-    };
+    let base = message.content.to_string();
     let content = append_descriptors(&base, &message.attachments);
     json!({ "role": role, "content": content })
 }
