@@ -147,9 +147,25 @@ impl MaxOrchestrator {
             return Ok(plan);
         }
         if let Some(llm) = self.llm.as_ref().filter(|llm| llm.is_available()) {
-            return Ok(Plan::Reply(llm.complete(ctx).await.map_err(|err| {
-                OrchestratorError::Backend(Arc::from(err.to_string()))
-            })?));
+            // Use the tool-aware path so the model can request `Plan::CallTool`
+            // when it needs the filesystem / http / memory tools. The plain
+            // `llm.complete(ctx)` default sends no `tools` field, so models
+            // reply with "I can't modify files" even when tools are registered.
+            let messages = ctx
+                .state
+                .transcript
+                .items
+                .iter()
+                .map(|item| item.message.clone())
+                .collect::<Vec<_>>();
+            let response = llm
+                .complete_messages(&messages, &self.available_tools)
+                .await
+                .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
+            if let Some(first) = response.tool_calls.first().cloned() {
+                return Ok(Plan::CallTool(first));
+            }
+            return Ok(Plan::Reply(response));
         }
         self.plan_internal(ctx, true).await
     }
