@@ -86,6 +86,11 @@ fn build_message(message: &Message) -> Value {
         MessageRole::System => "system",
         MessageRole::Tool | MessageRole::User => "user",
     };
+    eprintln!(
+        "openai build_message: role={role} content_len={} attachments={}",
+        message.content.len(),
+        message.attachments.len()
+    );
 
     let base_text = if message.role == MessageRole::Tool {
         format!("Tool result: {}", message.content)
