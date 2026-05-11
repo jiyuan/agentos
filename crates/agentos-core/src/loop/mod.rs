@@ -512,9 +512,23 @@ async fn execute_tool(
     let tools = deps
         .tools
         .ok_or_else(|| ToolRegistryError::UnknownTool(Arc::clone(&call.name)))?;
+    // Tool failures (bad path, missing file, malformed args) become a Failed
+    // `ToolResult` rather than aborting the run, so the model can read the
+    // error in the next turn and self-correct (e.g. create the missing dir
+    // and retry). Unknown-tool / isolation errors still bubble up — those
+    // indicate a misconfigured runtime, not a recoverable model mistake.
     let result = {
         let run_ctx = RunContext::from_state(state);
-        tools.call_with_context(&call, &run_ctx).await?
+        match tools.call_with_context(&call, &run_ctx).await {
+            Ok(result) => result,
+            Err(ToolRegistryError::Tool(tool_err)) => ToolResult {
+                call_id: call.id.clone(),
+                status: ToolStatus::Failed,
+                content: Arc::from(tool_err.to_string()),
+                metadata: BTreeMap::new(),
+            },
+            Err(other) => return Err(other.into()),
+        }
     };
 
     {

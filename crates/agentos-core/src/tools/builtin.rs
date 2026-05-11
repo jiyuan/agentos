@@ -134,6 +134,16 @@ impl Tool for FileTool {
             }
             "write" => {
                 let content = parsed.content.unwrap_or_default();
+                // Models routinely request writes into directories that
+                // don't exist yet (e.g. `workspace/skills/rss-digest/SKILL.md`).
+                // Create the parent chain so they don't get ENOENT on first
+                // touch — they can always rm afterwards if it wasn't desired.
+                if let Some(parent) = parsed.path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|err| ToolError::Failed(err.to_string().into()))?;
+                    }
+                }
                 std::fs::write(&parsed.path, content.as_bytes())
                     .map_err(|err| ToolError::Failed(err.to_string().into()))?;
                 let message = format!("wrote {} bytes", content.len());
