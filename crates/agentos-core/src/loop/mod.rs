@@ -553,6 +553,7 @@ fn tool_result_item(result: &ToolResult) -> Item {
         message: Message {
             role: MessageRole::Tool,
             content: Arc::clone(&result.content),
+            attachments: Vec::new(),
             metadata,
         },
         metadata: BTreeMap::new(),
@@ -581,6 +582,7 @@ fn subagent_result_item(result: &SubAgentRunOutput) -> Item {
         message: Message {
             role: MessageRole::Tool,
             content: Arc::clone(&result.message.content),
+            attachments: Vec::new(),
             metadata,
         },
         metadata: BTreeMap::new(),
@@ -621,6 +623,7 @@ fn suborchestrator_result_item(
         message: Message {
             role: MessageRole::Tool,
             content: Arc::from(content),
+            attachments: Vec::new(),
             metadata,
         },
         metadata: BTreeMap::new(),

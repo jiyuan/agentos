@@ -12,7 +12,7 @@ pub use ids::{
     AgentId, ChannelId, ConversationId, InterruptionId, Namespace, RecordId, RunId, SchemaVersion,
     SpanId, TaskId, ToolCallId,
 };
-pub use message::{Message, MessageRole};
+pub use message::{Attachment, AttachmentKind, Message, MessageRole};
 pub use tool::{ToolCall, ToolResult, ToolStatus};
 pub use trace::{SpanKind, TraceEvent, TraceSpan};
 pub use usage::Usage;

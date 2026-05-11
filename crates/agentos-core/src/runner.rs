@@ -172,6 +172,7 @@ pub fn approval_prompt_envelope(paused: &PausedRun, sender: Arc<str>) -> Option<
                 action_kind,
                 action_label
             )),
+            attachments: Vec::new(),
             metadata: BTreeMap::new(),
         },
         metadata,

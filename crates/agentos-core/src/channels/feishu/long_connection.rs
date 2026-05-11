@@ -1,8 +1,8 @@
-use super::event::{envelope_from_event, feishu_drop_reason};
+use super::event::{feishu_drop_reason, parse_event, ParsedFeishuEvent};
 use super::proto::{header_value, pong_frame, success_frame, FeishuFrame};
 use super::websocket::WebSocketConnection;
 use agentos_interfaces::ChannelError;
-use agentos_proto::{ChannelId, Envelope};
+use agentos_proto::ChannelId;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ impl FeishuLongConnection {
         channel_id: &ChannelId,
         allowed_source_ids: &[Arc<str>],
         log_receive_errors: bool,
-    ) -> Result<Option<Envelope>, ChannelError> {
+    ) -> Result<Option<ParsedFeishuEvent>, ChannelError> {
         loop {
             let payload = self.socket.read_frame().await?;
             let frame = FeishuFrame::decode(&payload)
@@ -65,8 +65,8 @@ impl FeishuLongConnection {
                 })?;
             let started = Instant::now();
             self.ack_event(&frame, started).await?;
-            if let Some(envelope) = envelope_from_event(&payload, channel_id, allowed_source_ids) {
-                return Ok(Some(envelope));
+            if let Some(parsed) = parse_event(&payload, channel_id, allowed_source_ids) {
+                return Ok(Some(parsed));
             }
             if log_receive_errors {
                 if let Some(reason) = feishu_drop_reason(&payload, allowed_source_ids) {
