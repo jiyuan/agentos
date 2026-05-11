@@ -229,7 +229,7 @@ impl AgentRuntime {
             trace_sink,
             task_workspace,
             pii_filter: PiiFilter,
-            max_output_length: MaxOutputLength::new(8_000),
+            max_output_length: MaxOutputLength::new(64_000),
             shell_allowlist: ShellCommandAllowlist::new(["printf", "echo", "pwd", "ls"]),
         })
     }
@@ -475,7 +475,10 @@ pub fn build_subagents(
         if subagent.inherit_guardrails {
             definition = definition
                 .with_input_guardrail("PiiFilter", PiiFilter)
-                .with_output_guardrail("MaxOutputLength", MaxOutputLength::new(8_000))
+                .with_output_guardrail(
+                    "MaxOutputLength",
+                    MaxOutputLength::new(subagent.max_output_chars),
+                )
                 .with_tool_guardrail(
                     "ShellCommandAllowlist",
                     ShellCommandAllowlist::new(["printf", "echo", "pwd", "ls"]),

@@ -20,6 +20,12 @@ pub struct SubAgentConfig {
     pub memory_tools: Vec<Arc<str>>,
     pub max_turns: usize,
     pub inherit_guardrails: bool,
+    /// Character cap for `MaxOutputLength` when `inherit_guardrails = true`.
+    /// Tripped output aborts the run, so this needs to comfortably exceed any
+    /// reply you expect from the model. Defaults are tuned for chat: long
+    /// enough to fit a thorough multi-paragraph answer, short enough to catch
+    /// runaway generation.
+    pub max_output_chars: usize,
 }
 
 impl Default for SubAgentConfig {
@@ -38,6 +44,7 @@ impl Default for SubAgentConfig {
             memory_tools: Vec::new(),
             max_turns: 4,
             inherit_guardrails: true,
+            max_output_chars: 64_000,
         }
     }
 }
