@@ -11,8 +11,8 @@ use crate::skills::WorkspaceSkillCatalog;
 use crate::subagents::{SubAgentDefinition, SubAgentRegistry};
 use crate::task_workspace::TaskWorkspace;
 use crate::tools::{
-    FileTool, HttpTool, MemoryTool, ShellTool, StaticMcpClient, StaticMcpTool, StdioMcpClient,
-    ToolRegistry,
+    FileTool, HttpTool, MemoryTool, ShellTool, SkillCreatorTool, StaticMcpClient, StaticMcpTool,
+    StdioMcpClient, ToolRegistry,
 };
 use agentos_interfaces::mcp::{McpClient, McpServer};
 use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
@@ -175,16 +175,20 @@ impl AgentRuntime {
         }
         let mcp_specs = register_configured_mcp(&mut tools, &workspace_config).await?;
         let model_controller = LlmModelController::new();
-        let subagents = build_subagents(
-            &workspace_config,
-            model_controller.clone(),
-            memory_manager.clone(),
-        )?;
+        // Skill catalog must be loaded before sub-agents are built so sub-agent
+        // MaxOrchestrators can hold a clone of it and dispatch skills (e.g.
+        // web-research, skill-creator).
         let skill_catalog = WorkspaceSkillCatalog::load_enabled(
             &skills_root(&paths.agent_config_path),
             &workspace_config.resources.skills.enabled,
         )
         .map_err(|err| format!("failed to load workspace skills: {err}"))?;
+        let subagents = build_subagents(
+            &workspace_config,
+            model_controller.clone(),
+            memory_manager.clone(),
+            skill_catalog.clone(),
+        )?;
         let resource_index =
             workspace_config.resource_index(&tools.specs(), &mcp_specs, &skill_catalog.metadata());
         let routing_table = workspace_config.routing_table()?;
@@ -445,6 +449,7 @@ pub fn build_subagents(
     config: &WorkspaceConfig,
     models: LlmModelController,
     memory_manager: Arc<MemoryManager>,
+    skill_catalog: WorkspaceSkillCatalog,
 ) -> Result<Option<SubAgentRegistry>, String> {
     if config.subagents.is_empty() {
         return Ok(None);
@@ -465,10 +470,13 @@ pub fn build_subagents(
         // so we can hand them to the orchestrator (which surfaces them as the
         // LLM's `tools` schema for function calling).
         let tool_specs = tools.specs();
+        // Narrow the parent's skill catalog to just what this sub-agent
+        // declared in its `skills` field. An empty list means inherit all.
+        let subagent_skill_catalog = skill_catalog.filtered(&subagent.skills);
         let mut definition = SubAgentDefinition::new(
             AgentId::new(Arc::clone(&subagent.id)),
             Arc::clone(&subagent.policy_id),
-            subagent_orchestrator(subagent, models.clone(), tool_specs)?,
+            subagent_orchestrator(subagent, models.clone(), tool_specs, subagent_skill_catalog)?,
             subagent_policy(subagent)?,
         )
         .with_tools(Arc::new(tools))
@@ -657,6 +665,7 @@ pub fn register_builtin_tool(tools: &mut ToolRegistry, name: &str) {
         "shell" => tools.register(ShellTool),
         "http" => tools.register(HttpTool),
         "file" => tools.register(FileTool),
+        "skill_create" => tools.register(SkillCreatorTool),
         _ => {}
     }
 }
@@ -665,6 +674,7 @@ fn subagent_orchestrator(
     subagent: &SubAgentConfig,
     models: LlmModelController,
     tool_specs: Vec<agentos_interfaces::tool::ToolSpec>,
+    skill_catalog: WorkspaceSkillCatalog,
 ) -> Result<Arc<dyn Orchestrator>, String> {
     let tier = LlmModelTier::from_config(&subagent.model_tier)?;
     match subagent.orchestrator.as_ref() {
@@ -673,10 +683,14 @@ fn subagent_orchestrator(
             MinOrchestrator::new(Arc::new(EnvLlm::new(tier, models)?)).with_tools(tool_specs),
         )),
         "builtin.max" | "builtin.tool_selecting" => Ok(Arc::new(
-            MaxOrchestrator::with_tools(tool_specs).with_llm(Arc::new(EnvLlm::new(tier, models)?)),
+            MaxOrchestrator::with_tools(tool_specs)
+                .with_skill_catalog(skill_catalog)
+                .with_llm(Arc::new(EnvLlm::new(tier, models)?)),
         )),
         _ => Ok(Arc::new(
-            MaxOrchestrator::with_tools(tool_specs).with_llm(Arc::new(EnvLlm::new(tier, models)?)),
+            MaxOrchestrator::with_tools(tool_specs)
+                .with_skill_catalog(skill_catalog)
+                .with_llm(Arc::new(EnvLlm::new(tier, models)?)),
         )),
     }
 }

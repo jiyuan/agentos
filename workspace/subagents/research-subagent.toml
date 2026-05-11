@@ -10,6 +10,7 @@ policy_id = "readonly-web"
 orchestrator = "builtin.max"
 model_tier = "low"
 tools = ["http", "memory"]
+skills = ["web-research"]
 memory_view = "shared_readonly"
 memory_domains = ["agentos"]
 memory_tools = ["read"]

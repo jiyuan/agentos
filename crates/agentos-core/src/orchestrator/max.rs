@@ -6,7 +6,7 @@ use super::routing::{
 use crate::memory::{
     memory_caller_from_context, HydrationRequest, MemoryManager, MemoryStore, RetrievalStrategy,
 };
-use crate::skills::{WebResearchSkill, WorkspaceSkillCatalog};
+use crate::skills::{SkillCreatorSkill, WebResearchSkill, WorkspaceSkillCatalog};
 use agentos_interfaces::orchestrator::{
     DispatchPriority, Orchestrator, OrchestratorError, Plan, ResourceEntry, ResourceIndex,
     ResourceKind, RoutingRule, RoutingTable, RunContext,
@@ -158,11 +158,6 @@ impl MaxOrchestrator {
                 .iter()
                 .map(|item| item.message.clone())
                 .collect::<Vec<_>>();
-            eprintln!(
-                "MaxOrchestrator::plan_with_llm fallback: messages={} available_tools={}",
-                messages.len(),
-                self.available_tools.len()
-            );
             let response = llm
                 .complete_messages(&messages, &self.available_tools)
                 .await
@@ -300,6 +295,9 @@ impl MaxOrchestrator {
         allow_routing_fallback: bool,
     ) -> Result<Plan, OrchestratorError> {
         if let Some(plan) = WebResearchSkill::new(&self.skill_catalog).plan(ctx)? {
+            return Ok(plan);
+        }
+        if let Some(plan) = SkillCreatorSkill::new(&self.skill_catalog).plan(ctx)? {
             return Ok(plan);
         }
 

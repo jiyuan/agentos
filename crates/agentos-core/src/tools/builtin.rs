@@ -1,11 +1,12 @@
 use crate::http::shared_client;
+use crate::skills::{create_skill, SkillCreation, SkillResourceKind};
 use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, value::RawValue, Value};
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
@@ -253,4 +254,172 @@ fn result_metadata(duration_ms: u64, bytes_out: u64) -> BTreeMap<Arc<str>, Value
     metadata.insert(Arc::from("duration_ms"), Value::from(duration_ms));
     metadata.insert(Arc::from("bytes_out"), Value::from(bytes_out));
     metadata
+}
+
+/// Tool wrapping `crate::skills::create_skill` so model-driven sub-agents can
+/// scaffold new workspace skills end-to-end (folder, frontmatter SKILL.md,
+/// optional resource subdirectories, and validation pass) inside the normal
+/// run-loop approval and guardrail flow.
+#[derive(Default)]
+pub struct SkillCreatorTool;
+
+#[derive(Debug, Deserialize)]
+struct SkillCreateArgs {
+    name: String,
+    description: String,
+    #[serde(default)]
+    resources: Vec<String>,
+    /// Override the workspace skills directory. Defaults to `workspace/skills`
+    /// relative to the gateway's cwd, matching `runtime::skills_root()`.
+    #[serde(default)]
+    root: Option<PathBuf>,
+}
+
+#[async_trait]
+impl Tool for SkillCreatorTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: Arc::from("skill_create"),
+            description: Arc::from(
+                "Scaffold a new workspace skill following the Anthropic \
+                 SKILL.md folder format. Creates workspace/skills/<name>/SKILL.md \
+                 with YAML frontmatter and an optional set of bundled resource \
+                 directories (scripts, references, assets). Validates the \
+                 result before returning.",
+            ),
+            input_schema: json!({
+                "type": "object",
+                "required": ["name", "description"],
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Skill name in lowercase hyphen-case (e.g. rss-digest)."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "One-line description used as the catalog summary."
+                    },
+                    "resources": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["scripts", "references", "assets"] },
+                        "description": "Optional bundled resource subdirectories to create."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Override for the workspace skills root. Defaults to workspace/skills."
+                    }
+                }
+            }),
+            requires_isolation: false,
+        }
+    }
+
+    async fn call(&self, call: &ToolCall, args: &RawValue) -> Result<ToolResult, ToolError> {
+        let parsed: SkillCreateArgs = serde_json::from_str(args.get())
+            .map_err(|err| ToolError::Failed(err.to_string().into()))?;
+        let start = Instant::now();
+
+        let mut resources = BTreeSet::new();
+        for entry in &parsed.resources {
+            let kind = match entry.as_str() {
+                "scripts" => SkillResourceKind::Scripts,
+                "references" => SkillResourceKind::References,
+                "assets" => SkillResourceKind::Assets,
+                other => {
+                    return Err(ToolError::Failed(Arc::from(format!(
+                        "unknown resource kind '{other}'; expected scripts, references, or assets"
+                    ))));
+                }
+            };
+            resources.insert(kind);
+        }
+
+        let creation = SkillCreation {
+            name: Arc::from(parsed.name.as_str()),
+            description: Arc::from(parsed.description.as_str()),
+            resources,
+        };
+        let root: PathBuf = parsed
+            .root
+            .unwrap_or_else(|| Path::new("workspace").join("skills"));
+        let skill = create_skill(&root, &creation)
+            .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
+
+        let message = format!("created skill '{}' at {}", skill.name, skill.path.display());
+        let bytes_out = message.len() as u64;
+        Ok(ToolResult {
+            call_id: call.id.clone(),
+            status: ToolStatus::Succeeded,
+            content: Arc::from(message),
+            metadata: result_metadata(elapsed_ms(start), bytes_out),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentos_proto::ToolCallId;
+
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new(id),
+            name: Arc::from("skill_create"),
+            args: RawValue::from_string("{}".to_owned()).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_creator_tool_scaffolds_skill_dir_and_markdown() {
+        let tmp = std::env::temp_dir().join(format!(
+            "skill-creator-tool-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let args = json!({
+            "name": "test-skill",
+            "description": "Smoke test for SkillCreatorTool.",
+            "resources": ["scripts"],
+            "root": tmp.to_string_lossy(),
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let call = tool_call("call_1");
+        let result = SkillCreatorTool.call(&call, &raw).await.unwrap();
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        assert!(result.content.contains("test-skill"));
+        let skill_md = tmp.join("test-skill").join("SKILL.md");
+        let body = std::fs::read_to_string(&skill_md).unwrap();
+        assert!(body.contains("name: test-skill"));
+        assert!(body.contains("Smoke test for SkillCreatorTool."));
+        assert!(tmp.join("test-skill").join("scripts").is_dir());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn skill_creator_tool_rejects_unknown_resource() {
+        let tmp = std::env::temp_dir().join(format!(
+            "skill-creator-bad-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let args = json!({
+            "name": "another-skill",
+            "description": "n/a",
+            "resources": ["nope"],
+            "root": tmp.to_string_lossy(),
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let err = SkillCreatorTool
+            .call(&tool_call("call_2"), &raw)
+            .await
+            .unwrap_err();
+        let ToolError::Failed(msg) = err;
+        assert!(msg.contains("unknown resource kind"));
+    }
 }

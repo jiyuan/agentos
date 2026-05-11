@@ -95,6 +95,27 @@ impl WorkspaceSkillCatalog {
     pub fn skills(&self) -> impl Iterator<Item = &WorkspaceSkill> {
         self.skills.values()
     }
+
+    /// Return a sub-catalog containing only the named skills (in any order).
+    /// Names are normalised to lowercase hyphen-case before lookup. Unknown
+    /// names are silently skipped — callers that care about presence should
+    /// check with [`Self::contains`] first.
+    ///
+    /// An empty `names` slice returns an empty catalog — skill access is
+    /// opt-in at the sub-agent level, not inherited by default. This
+    /// differs from [`Self::load_enabled`]'s "empty = unfiltered" workspace
+    /// semantics because the parent workspace decides what *exists*, while
+    /// each sub-agent decides what it *may dispatch*.
+    pub fn filtered(&self, names: &[Arc<str>]) -> Self {
+        let mut skills = BTreeMap::new();
+        for name in names {
+            let normalized = normalize_skill_name(name);
+            if let Some(skill) = self.skills.get::<str>(normalized.as_str()) {
+                skills.insert(Arc::clone(&skill.name), skill.clone());
+            }
+        }
+        Self { skills }
+    }
 }
 
 impl SkillCreation {
@@ -380,5 +401,60 @@ fn yaml_scalar(input: &str) -> String {
         input.to_owned()
     } else {
         format!("{:?}", input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skill(name: &str) -> WorkspaceSkill {
+        WorkspaceSkill {
+            name: Arc::from(name),
+            description: Arc::from(format!("desc for {name}")),
+            path: PathBuf::from(format!("/tmp/{name}")),
+            instructions: Arc::from("body"),
+        }
+    }
+
+    fn catalog(names: &[&str]) -> WorkspaceSkillCatalog {
+        let mut skills = BTreeMap::new();
+        for name in names {
+            let s = skill(name);
+            skills.insert(Arc::clone(&s.name), s);
+        }
+        WorkspaceSkillCatalog { skills }
+    }
+
+    #[test]
+    fn filtered_returns_subset_by_name() {
+        let cat = catalog(&["web-research", "skill-creator", "ghost"]);
+        let sub = cat.filtered(&[Arc::from("web-research"), Arc::from("skill-creator")]);
+        assert!(sub.contains("web-research"));
+        assert!(sub.contains("skill-creator"));
+        assert!(!sub.contains("ghost"));
+    }
+
+    #[test]
+    fn filtered_empty_means_no_skills_granted() {
+        let cat = catalog(&["web-research", "skill-creator"]);
+        let sub = cat.filtered(&[]);
+        assert!(sub.is_empty());
+    }
+
+    #[test]
+    fn filtered_silently_drops_unknown_names() {
+        let cat = catalog(&["web-research"]);
+        let sub = cat.filtered(&[Arc::from("web-research"), Arc::from("does-not-exist")]);
+        assert!(sub.contains("web-research"));
+        assert!(!sub.contains("does-not-exist"));
+    }
+
+    #[test]
+    fn filtered_normalises_input_names() {
+        let cat = catalog(&["web-research"]);
+        // Mixed case + leading whitespace should still resolve to web-research.
+        let sub = cat.filtered(&[Arc::from("  Web-Research  ")]);
+        assert!(sub.contains("web-research"));
     }
 }

@@ -7,9 +7,10 @@ Prefer clear, concise answers.
 Do not claim tool results unless a tool was actually used.
 """
 policy_id = "general"
-orchestrator = "builtin.min"
+orchestrator = "builtin.max"
 model_tier = "medium"
-tools = ["http", "file", "memory"]
+tools = ["http", "file", "memory", "skill_create"]
+skills = ["web-research", "skill-creator"]
 memory_view = "shared_readonly"
 memory_domains = ["agentos"]
 memory_tools = ["read", "write"]

@@ -63,7 +63,7 @@ priority = ["skills", "tools", "mcp", "llm"]
 enabled = ["skill-creator", "web-research"]
 
 [resources.tools]
-enabled = ["file", "http", "memory", "shell"]
+enabled = ["file", "http", "memory", "shell", "skill_create"]
 
 [resources.mcp]
 enabled = ["remote_echo"]

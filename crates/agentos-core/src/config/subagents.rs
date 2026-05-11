@@ -15,6 +15,12 @@ pub struct SubAgentConfig {
     pub orchestrator: Arc<str>,
     pub model_tier: Arc<str>,
     pub tools: Vec<Arc<str>>,
+    /// Skills (by name) this sub-agent is permitted to dispatch. Each entry
+    /// must also appear in the parent runtime's `resources.skills.enabled`
+    /// list — unknown names are silently dropped at build time. Skill access
+    /// is opt-in: an empty vector means the sub-agent cannot dispatch any
+    /// skill, even if the parent has them loaded.
+    pub skills: Vec<Arc<str>>,
     pub memory_view: Arc<str>,
     pub memory_domains: Vec<Arc<str>>,
     pub memory_tools: Vec<Arc<str>>,
@@ -39,6 +45,7 @@ impl Default for SubAgentConfig {
             orchestrator: Arc::from("builtin.max"),
             model_tier: Arc::from("medium"),
             tools: vec![Arc::from("http")],
+            skills: Vec::new(),
             memory_view: Arc::from("none"),
             memory_domains: Vec::new(),
             memory_tools: Vec::new(),
