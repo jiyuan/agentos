@@ -3,7 +3,9 @@ mod mcp;
 mod memory;
 mod registry;
 
-pub use builtin::{CronCreatorTool, FileTool, HttpTool, ShellTool, SkillCreatorTool};
+pub use builtin::{
+    CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, ShellTool, SkillCreatorTool,
+};
 pub use mcp::{McpTool, StaticMcpClient, StaticMcpTool, StdioMcpClient};
 pub use memory::MemoryTool;
 pub use registry::{call_isolated_subprocess, ToolRegistry, ToolRegistryError};

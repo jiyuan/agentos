@@ -4,18 +4,22 @@ use crate::guardrails::{MaxOutputLength, PiiFilter, ShellCommandAllowlist};
 use crate::memory::{
     InMemoryMemory, MemoryManager, QdrantSemanticIndex, SqliteStore, SqliteVecSemanticIndex,
 };
-use crate::orchestrator::{EchoOrchestrator, MaxOrchestrator, MinOrchestrator};
+use crate::orchestrator::{
+    EchoOrchestrator, MaxOrchestrator, MemoryHydrationSettings, MinOrchestrator,
+};
 use crate::r#loop::{InputGuardrailEntry, OutputGuardrailEntry, ToolGuardrailEntry};
 use crate::runner::{JsonlTraceSink, RunnerDeps, TraceSink};
 use crate::skills::WorkspaceSkillCatalog;
 use crate::subagents::{SubAgentDefinition, SubAgentRegistry};
 use crate::task_workspace::TaskWorkspace;
 use crate::tools::{
-    CronCreatorTool, FileTool, HttpTool, MemoryTool, ShellTool, SkillCreatorTool, StaticMcpClient,
-    StaticMcpTool, StdioMcpClient, ToolRegistry,
+    CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, MemoryTool, ShellTool,
+    SkillCreatorTool, StaticMcpClient, StaticMcpTool, StdioMcpClient, ToolRegistry,
 };
 use agentos_interfaces::mcp::{McpClient, McpServer};
-use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
+use agentos_interfaces::orchestrator::{
+    Orchestrator, OrchestratorError, Plan, ResourceIndex, RunContext,
+};
 use agentos_interfaces::tool::ToolSpec;
 use agentos_llm::{EnvLlm, LlmModelController, LlmModelTier};
 use agentos_proto::AgentId;
@@ -455,6 +459,11 @@ pub fn build_subagents(
         return Ok(None);
     }
 
+    // Hoist memory hydration settings out of the per-sub-agent loop — they
+    // come from workspace_config.memory and are identical for every sub-agent
+    // that opts in via memory_view.
+    let hydration_settings = config.memory.hydration_settings()?;
+
     let mut registry = SubAgentRegistry::new();
     for subagent in &config.subagents {
         let mut tools = ToolRegistry::new();
@@ -471,12 +480,44 @@ pub fn build_subagents(
         // LLM's `tools` schema for function calling).
         let tool_specs = tools.specs();
         // Narrow the parent's skill catalog to just what this sub-agent
-        // declared in its `skills` field. An empty list means inherit all.
+        // declared in its `skills` field. An empty list means no access.
         let subagent_skill_catalog = skill_catalog.filtered(&subagent.skills);
+        // Warn (but don't fail) when a sub-agent declares a skill the
+        // parent didn't load. Helps operators catch typos and staging
+        // mistakes.
+        for declared in &subagent.skills {
+            if !skill_catalog.contains(declared) {
+                tracing::warn!(
+                    subagent = %subagent.id,
+                    skill = %declared,
+                    "sub-agent declared skill that is not in the parent's loaded catalog"
+                );
+            }
+        }
+        // Build the per-sub-agent resource_index so the LLM sees its own
+        // tools AND skills as available resources. Reuses the parent's
+        // helper that knows how to weave tools + mcp + skills into the
+        // ResourceIndex shape (mcp_specs are parent-only).
+        let subagent_resource_index =
+            config.resource_index(&tool_specs, &[], &subagent_skill_catalog.metadata());
+        // Sub-agents that don't opt into memory_view skip the hydrator —
+        // hydrating a transcript the model can't read from is wasted work.
+        let memory_hydrator = if subagent.memory_view.as_ref() != "none" {
+            Some((memory_manager.clone(), hydration_settings.clone()))
+        } else {
+            None
+        };
         let mut definition = SubAgentDefinition::new(
             AgentId::new(Arc::clone(&subagent.id)),
             Arc::clone(&subagent.policy_id),
-            subagent_orchestrator(subagent, models.clone(), tool_specs, subagent_skill_catalog)?,
+            subagent_orchestrator(
+                subagent,
+                models.clone(),
+                tool_specs,
+                subagent_skill_catalog,
+                subagent_resource_index,
+                memory_hydrator,
+            )?,
             subagent_policy(subagent)?,
         )
         .with_tools(Arc::new(tools))
@@ -667,6 +708,8 @@ pub fn register_builtin_tool(tools: &mut ToolRegistry, name: &str) {
         "file" => tools.register(FileTool),
         "skill_create" => tools.register(SkillCreatorTool),
         "cron_create" => tools.register(CronCreatorTool),
+        "cron_list" => tools.register(CronListTool),
+        "cron_remove" => tools.register(CronRemoveTool),
         _ => {}
     }
 }
@@ -676,6 +719,8 @@ fn subagent_orchestrator(
     models: LlmModelController,
     tool_specs: Vec<agentos_interfaces::tool::ToolSpec>,
     skill_catalog: WorkspaceSkillCatalog,
+    resource_index: ResourceIndex,
+    memory_hydrator: Option<(Arc<MemoryManager>, MemoryHydrationSettings)>,
 ) -> Result<Arc<dyn Orchestrator>, String> {
     let tier = LlmModelTier::from_config(&subagent.model_tier)?;
     match subagent.orchestrator.as_ref() {
@@ -683,16 +728,26 @@ fn subagent_orchestrator(
         "builtin.min" | "builtin.llm" | "builtin.llm_fallback" => Ok(Arc::new(
             MinOrchestrator::new(Arc::new(EnvLlm::new(tier, models)?)).with_tools(tool_specs),
         )),
-        "builtin.max" | "builtin.tool_selecting" => Ok(Arc::new(
-            MaxOrchestrator::with_tools(tool_specs)
+        "builtin.max" | "builtin.tool_selecting" => {
+            let mut orchestrator = MaxOrchestrator::with_tools(tool_specs)
+                .with_resource_index(resource_index)
                 .with_skill_catalog(skill_catalog)
-                .with_llm(Arc::new(EnvLlm::new(tier, models)?)),
-        )),
-        _ => Ok(Arc::new(
-            MaxOrchestrator::with_tools(tool_specs)
+                .with_llm(Arc::new(EnvLlm::new(tier, models)?));
+            if let Some((manager, settings)) = memory_hydrator {
+                orchestrator = orchestrator.with_memory_hydrator(manager, settings);
+            }
+            Ok(Arc::new(orchestrator))
+        }
+        _ => {
+            let mut orchestrator = MaxOrchestrator::with_tools(tool_specs)
+                .with_resource_index(resource_index)
                 .with_skill_catalog(skill_catalog)
-                .with_llm(Arc::new(EnvLlm::new(tier, models)?)),
-        )),
+                .with_llm(Arc::new(EnvLlm::new(tier, models)?));
+            if let Some((manager, settings)) = memory_hydrator {
+                orchestrator = orchestrator.with_memory_hydrator(manager, settings);
+            }
+            Ok(Arc::new(orchestrator))
+        }
     }
 }
 

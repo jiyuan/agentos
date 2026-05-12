@@ -1,6 +1,7 @@
 use crate::approve::Policy;
 use crate::hooks::Hooks;
 mod episodes;
+mod task_session;
 
 use crate::memory::MemoryManager;
 use crate::r#loop::{
@@ -17,7 +18,7 @@ use agentos_interfaces::session::{Item, Session, SessionError};
 use agentos_interfaces::RunState;
 use agentos_proto::{
     AgentId, ChannelId, ConversationId, Envelope, InterruptionId, Message, MessageRole, RunId,
-    SpanKind, TaskId,
+    SpanKind,
 };
 use episodes::{record_denied_episode, record_error_episode, record_finished_episode, EpisodeSeed};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,11 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use task_session::{
+    activate_for_resume as activate_task_workspace_for_resume,
+    activate_for_run as activate_task_workspace_for_run, active as active_task_session,
+    persist_items as persist_task_session_items, task_id_for_state,
+};
 use thiserror::Error;
 use tracing::info;
 
@@ -540,173 +546,6 @@ async fn finish(
     };
 
     Ok((state, output))
-}
-
-#[derive(Clone, Debug)]
-struct ActiveTaskSession<'a> {
-    workspace: &'a TaskWorkspace,
-    task_id: TaskId,
-    session_id: Arc<str>,
-}
-
-fn activate_task_workspace_for_run<'a>(
-    state: &mut RunState,
-    input: &Envelope,
-    deps: &'a RunnerDeps<'_>,
-) -> Result<Option<ActiveTaskSession<'a>>, RunnerError> {
-    let Some(workspace) = deps.task_workspace else {
-        return Ok(None);
-    };
-    let task_id = task_id_for_run(state, input);
-    let session_id = Arc::from(sanitize_file_stem(state.run_id.as_str()));
-    workspace.init_task(&task_id)?;
-    state.task_id = Some(task_id.clone());
-    state.task_session_id = Some(Arc::clone(&session_id));
-    let active = ActiveTaskSession {
-        workspace,
-        task_id,
-        session_id,
-    };
-    append_task_session_event(
-        &active,
-        json!({
-            "event": "session_started",
-            "phase": "run",
-            "run_id": state.run_id.as_str(),
-            "active_agent": state.active_agent.as_str(),
-            "conversation_id": input.conversation_id.as_str(),
-            "channel_id": input.channel_id.as_str(),
-        }),
-    )?;
-    append_task_session_event(
-        &active,
-        json!({
-            "event": "input",
-            "message": input.message,
-            "metadata": input.metadata,
-        }),
-    )?;
-    Ok(Some(active))
-}
-
-fn activate_task_workspace_for_resume<'a>(
-    state: &mut RunState,
-    deps: &'a RunnerDeps<'_>,
-) -> Result<Option<ActiveTaskSession<'a>>, RunnerError> {
-    let Some(workspace) = deps.task_workspace else {
-        return Ok(None);
-    };
-    let task_id = state
-        .task_id
-        .clone()
-        .unwrap_or_else(|| task_id_for_state(state));
-    let session_id = Arc::from(format!(
-        "{}-resume-{}",
-        sanitize_file_stem(state.run_id.as_str()),
-        state.trace_events.len()
-    ));
-    workspace.init_task(&task_id)?;
-    state.task_id = Some(task_id.clone());
-    state.task_session_id = Some(Arc::clone(&session_id));
-    let active = ActiveTaskSession {
-        workspace,
-        task_id,
-        session_id,
-    };
-    append_task_session_event(
-        &active,
-        json!({
-            "event": "session_started",
-            "phase": "resume",
-            "run_id": state.run_id.as_str(),
-            "active_agent": state.active_agent.as_str(),
-        }),
-    )?;
-    Ok(Some(active))
-}
-
-fn active_task_session<'a>(
-    state: &RunState,
-    deps: &'a RunnerDeps<'_>,
-) -> Option<ActiveTaskSession<'a>> {
-    let workspace = deps.task_workspace?;
-    Some(ActiveTaskSession {
-        workspace,
-        task_id: state
-            .task_id
-            .clone()
-            .unwrap_or_else(|| task_id_for_state(state)),
-        session_id: state
-            .task_session_id
-            .clone()
-            .unwrap_or_else(|| Arc::from(sanitize_file_stem(state.run_id.as_str()))),
-    })
-}
-
-fn task_id_for_run(state: &RunState, input: &Envelope) -> TaskId {
-    input
-        .metadata
-        .get("task_id")
-        .and_then(Value::as_str)
-        .map(TaskId::new)
-        .unwrap_or_else(|| task_id_for_state(state))
-}
-
-fn task_id_for_state(state: &RunState) -> TaskId {
-    if state.active_agent.as_str() == "general-subagent" {
-        TaskId::new("general")
-    } else {
-        TaskId::new(state.run_id.as_str())
-    }
-}
-
-fn persist_task_session_items(
-    active: Option<&ActiveTaskSession<'_>>,
-    phase: &'static str,
-    items: &[Item],
-) -> Result<(), RunnerError> {
-    let Some(active) = active else {
-        return Ok(());
-    };
-    for (index, item) in items.iter().enumerate() {
-        append_task_session_event(
-            active,
-            json!({
-                "event": "transcript_item",
-                "phase": phase,
-                "index": index,
-                "message": item.message,
-                "metadata": item.metadata,
-            }),
-        )?;
-    }
-    append_task_session_event(
-        active,
-        json!({
-            "event": "session_finished",
-            "phase": phase,
-        }),
-    )
-}
-
-fn append_task_session_event(
-    active: &ActiveTaskSession<'_>,
-    event: Value,
-) -> Result<(), RunnerError> {
-    active
-        .workspace
-        .append_session_event(&active.task_id, &active.session_id, &event)?;
-    Ok(())
-}
-
-fn sanitize_file_stem(input: &str) -> String {
-    input
-        .chars()
-        .map(|ch| match ch {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' | ':' => ch,
-            _ => '_',
-        })
-        .collect()
 }
 
 fn record_run_start(state: &mut RunState, hooks: Option<&Hooks>) {

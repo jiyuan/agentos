@@ -1,24 +1,23 @@
 use crate::channels::attachments::{file_size, AttachmentStore};
 use crate::channels::text::split_text;
+use crate::http::shared_client;
 use agentos_interfaces::{Channel, ChannelError};
 use agentos_proto::{Attachment, AttachmentKind, ChannelId, Envelope};
 use async_trait::async_trait;
+use reqwest::multipart::{Form, Part};
 use serde_json::{json, Value};
 use std::env;
 use std::path::Path;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::fs;
 
 mod event;
 mod long_connection;
 mod proto;
 mod websocket;
 
-use event::{
-    curl_failure_message, feishu_allowed_source_ids_from_env, feishu_receive_id_type,
-    AttachmentDescriptor,
-};
+use event::{feishu_allowed_source_ids_from_env, feishu_receive_id_type, AttachmentDescriptor};
 use long_connection::{FeishuEndpoint, FeishuLongConnection};
 
 const DEFAULT_API_BASE: &str = "https://open.feishu.cn/open-apis";
@@ -83,36 +82,41 @@ impl FeishuChannel {
         format!("{}/{}", self.api_base, path.trim_start_matches('/'))
     }
 
-    fn tenant_access_token(&self) -> Result<Arc<str>, ChannelError> {
+    fn cached_tenant_token(&self) -> Result<Option<Arc<str>>, ChannelError> {
         let now = unix_now()?;
+        let cache = self
+            .tenant_token
+            .lock()
+            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        Ok(cache
+            .as_ref()
+            .and_then(|cached| (cached.expires_at > now).then(|| Arc::clone(&cached.token))))
+    }
+
+    fn store_tenant_token(&self, token: Arc<str>, expires_at: u64) -> Result<(), ChannelError> {
         let mut cache = self
             .tenant_token
             .lock()
             .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        if let Some(cached) = cache.as_ref() {
-            if cached.expires_at > now {
-                return Ok(Arc::clone(&cached.token));
-            }
+        *cache = Some(CachedTenantToken { token, expires_at });
+        Ok(())
+    }
+
+    async fn tenant_access_token(&self) -> Result<Arc<str>, ChannelError> {
+        if let Some(token) = self.cached_tenant_token()? {
+            return Ok(token);
         }
 
         let body = json!({
             "app_id": self.app_id.as_ref(),
             "app_secret": self.app_secret.as_ref(),
-        })
-        .to_string();
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
-            .arg(self.api_url("auth/v3/tenant_access_token/internal"))
-            .args(["-H", "Content-Type: application/json", "--data", &body])
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ChannelError::Backend(Arc::from(stderr.trim().to_owned())));
-        }
-
-        let response: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        });
+        let response: Value = post_json(
+            &self.api_url("auth/v3/tenant_access_token/internal"),
+            None,
+            &body,
+        )
+        .await?;
         if response.get("code").and_then(Value::as_i64) != Some(0) {
             return Err(ChannelError::Backend(Arc::from(response.to_string())));
         }
@@ -128,62 +132,42 @@ impl FeishuChannel {
             .get("expire")
             .and_then(Value::as_u64)
             .unwrap_or(7_200);
-        let token = Arc::from(token);
-        *cache = Some(CachedTenantToken {
-            token: Arc::clone(&token),
-            expires_at: now.saturating_add(expire.saturating_sub(60)),
-        });
+        let token: Arc<str> = Arc::from(token);
+        let now = unix_now()?;
+        self.store_tenant_token(
+            Arc::clone(&token),
+            now.saturating_add(expire.saturating_sub(60)),
+        )?;
         Ok(token)
     }
 
-    fn send_text(&self, receive_id: &str, text: &str) -> Result<(), ChannelError> {
+    async fn send_text(&self, receive_id: &str, text: &str) -> Result<(), ChannelError> {
         for chunk in split_text(text, FEISHU_TEXT_LIMIT) {
             let content = json!({ "text": chunk }).to_string();
-            self.send_message(receive_id, "text", &content)?;
+            self.send_message(receive_id, "text", &content).await?;
         }
         Ok(())
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         receive_id: &str,
         msg_type: &str,
         content_json: &str,
     ) -> Result<(), ChannelError> {
-        let token = self.tenant_access_token()?;
-        let authorization = format!("Authorization: Bearer {token}");
+        let token = self.tenant_access_token().await?;
         let body = json!({
             "receive_id": receive_id,
             "msg_type": msg_type,
             "content": content_json,
-        })
-        .to_string();
+        });
         let receive_id_type = feishu_receive_id_type(receive_id, self.receive_id_type.as_ref());
         let url = format!(
             "{}?receive_id_type={}",
             self.api_url("im/v1/messages"),
             receive_id_type
         );
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
-            .arg(url)
-            .args([
-                "-H",
-                &authorization,
-                "-H",
-                "Content-Type: application/json",
-                "--data",
-                &body,
-            ])
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ChannelError::Backend(Arc::from(stderr.trim().to_owned())));
-        }
-
-        let response: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        let response: Value = post_json(&url, Some(token.as_ref()), &body).await?;
         if response.get("code").and_then(Value::as_i64) == Some(0) {
             Ok(())
         } else {
@@ -191,38 +175,35 @@ impl FeishuChannel {
         }
     }
 
-    fn download_resource(
+    async fn download_resource(
         &self,
         message_id: &str,
         key: &str,
         kind: &str,
         target: &Path,
     ) -> Result<(), ChannelError> {
-        let token = self.tenant_access_token()?;
-        let authorization = format!("Authorization: Bearer {token}");
+        let token = self.tenant_access_token().await?;
         let url = format!(
             "{}?type={kind}",
             self.api_url(&format!("im/v1/messages/{message_id}/resources/{key}"))
         );
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--fail", "--max-time", "60"])
-            .arg("-o")
-            .arg(target)
-            .arg("-H")
-            .arg(&authorization)
-            .arg(url)
-            .output()
+        let bytes = shared_client()
+            .get(url)
+            .bearer_auth(token.as_ref())
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(reqwest_to_channel_err)?
+            .bytes()
+            .await
+            .map_err(reqwest_to_channel_err)?;
+        fs::write(target, &bytes)
+            .await
             .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        if !output.status.success() {
-            return Err(ChannelError::Backend(Arc::from(format!(
-                "Feishu resource download failed: {}",
-                curl_failure_message(&output.stdout, &output.stderr)
-            ))));
-        }
         Ok(())
     }
 
-    fn download_attachments(
+    async fn download_attachments(
         &self,
         descriptors: &[AttachmentDescriptor],
         conversation: &str,
@@ -237,7 +218,8 @@ impl FeishuChannel {
                 AttachmentKind::Image => "image",
                 AttachmentKind::Document => "file",
             };
-            self.download_resource(message_id, &desc.key, kind, &target)?;
+            self.download_resource(message_id, &desc.key, kind, &target)
+                .await?;
             let size = file_size(&target);
             out.push(Attachment {
                 kind: desc.kind.clone(),
@@ -251,26 +233,29 @@ impl FeishuChannel {
         Ok(out)
     }
 
-    fn upload_image(&self, path: &Path) -> Result<String, ChannelError> {
-        let token = self.tenant_access_token()?;
-        let authorization = format!("Authorization: Bearer {token}");
-        let file_form = format!("image=@{}", path.display());
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--max-time", "60", "-X", "POST"])
-            .arg(self.api_url("im/v1/images"))
-            .arg("-H")
-            .arg(&authorization)
-            .args(["-F", "image_type=message", "-F", &file_form])
-            .output()
+    async fn upload_image(&self, path: &Path) -> Result<String, ChannelError> {
+        let token = self.tenant_access_token().await?;
+        let bytes = fs::read(path)
+            .await
             .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        if !output.status.success() {
-            return Err(ChannelError::Backend(Arc::from(curl_failure_message(
-                &output.stdout,
-                &output.stderr,
-            ))));
-        }
-        let response: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "image".to_owned());
+        let form = Form::new()
+            .text("image_type", "message")
+            .part("image", Part::bytes(bytes).file_name(file_name));
+        let response: Value = shared_client()
+            .post(self.api_url("im/v1/images"))
+            .bearer_auth(token.as_ref())
+            .multipart(form)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(reqwest_to_channel_err)?
+            .json()
+            .await
+            .map_err(reqwest_to_channel_err)?;
         if response.get("code").and_then(Value::as_i64) != Some(0) {
             return Err(ChannelError::Backend(Arc::from(response.to_string())));
         }
@@ -284,27 +269,27 @@ impl FeishuChannel {
             })
     }
 
-    fn upload_file(&self, name: &str, path: &Path) -> Result<String, ChannelError> {
-        let token = self.tenant_access_token()?;
-        let authorization = format!("Authorization: Bearer {token}");
-        let file_form = format!("file=@{}", path.display());
-        let name_form = format!("file_name={name}");
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--max-time", "60", "-X", "POST"])
-            .arg(self.api_url("im/v1/files"))
-            .arg("-H")
-            .arg(&authorization)
-            .args(["-F", "file_type=stream", "-F", &name_form, "-F", &file_form])
-            .output()
+    async fn upload_file(&self, name: &str, path: &Path) -> Result<String, ChannelError> {
+        let token = self.tenant_access_token().await?;
+        let bytes = fs::read(path)
+            .await
             .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        if !output.status.success() {
-            return Err(ChannelError::Backend(Arc::from(curl_failure_message(
-                &output.stdout,
-                &output.stderr,
-            ))));
-        }
-        let response: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
+        let part = Part::bytes(bytes).file_name(name.to_owned());
+        let form = Form::new()
+            .text("file_type", "stream")
+            .text("file_name", name.to_owned())
+            .part("file", part);
+        let response: Value = shared_client()
+            .post(self.api_url("im/v1/files"))
+            .bearer_auth(token.as_ref())
+            .multipart(form)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(reqwest_to_channel_err)?
+            .json()
+            .await
+            .map_err(reqwest_to_channel_err)?;
         if response.get("code").and_then(Value::as_i64) != Some(0) {
             return Err(ChannelError::Backend(Arc::from(response.to_string())));
         }
@@ -316,57 +301,41 @@ impl FeishuChannel {
             .ok_or_else(|| ChannelError::Backend(Arc::from("Feishu file upload missing file_key")))
     }
 
-    fn send_attachment(
+    async fn send_attachment(
         &self,
         receive_id: &str,
         attachment: &Attachment,
     ) -> Result<(), ChannelError> {
         match attachment.kind {
             AttachmentKind::Image => {
-                let key = self.upload_image(&attachment.path)?;
+                let key = self.upload_image(&attachment.path).await?;
                 let content = json!({ "image_key": key }).to_string();
-                self.send_message(receive_id, "image", &content)
+                self.send_message(receive_id, "image", &content).await
             }
             AttachmentKind::Document => {
-                let key = self.upload_file(&attachment.name, &attachment.path)?;
+                let key = self.upload_file(&attachment.name, &attachment.path).await?;
                 let content = json!({ "file_key": key }).to_string();
-                self.send_message(receive_id, "file", &content)
+                self.send_message(receive_id, "file", &content).await
             }
         }
     }
 
-    fn websocket_endpoint(&self) -> Result<FeishuEndpoint, ChannelError> {
+    async fn websocket_endpoint(&self) -> Result<FeishuEndpoint, ChannelError> {
         let body = json!({
             "AppID": self.app_id.as_ref(),
             "AppSecret": self.app_secret.as_ref(),
-        })
-        .to_string();
-        let output = Command::new("curl")
-            .args(["--silent", "--show-error", "--max-time", "10", "-X", "POST"])
-            .arg(self.platform_url("callback/ws/endpoint"))
-            .args([
-                "-H",
-                "Content-Type: application/json",
-                "-H",
-                "locale: zh",
-                "--data",
-                &body,
-            ])
-            .output()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        if !output.status.success() {
-            return Err(ChannelError::Backend(Arc::from(curl_failure_message(
-                &output.stdout,
-                &output.stderr,
-            ))));
-        }
-
-        let response: Value = serde_json::from_slice(&output.stdout).map_err(|err| {
-            ChannelError::Backend(Arc::from(format!(
-                "Feishu WebSocket endpoint JSON parse failed: {err}; body={}",
-                String::from_utf8_lossy(&output.stdout)
-            )))
-        })?;
+        });
+        let response: Value = shared_client()
+            .post(self.platform_url("callback/ws/endpoint"))
+            .header("locale", "zh")
+            .json(&body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(reqwest_to_channel_err)?
+            .json()
+            .await
+            .map_err(reqwest_to_channel_err)?;
         if response.get("code").and_then(Value::as_i64) != Some(0) {
             return Err(ChannelError::Backend(Arc::from(response.to_string())));
         }
@@ -384,7 +353,7 @@ impl FeishuChannel {
 
     async fn long_connection(&mut self) -> Result<&mut FeishuLongConnection, ChannelError> {
         if self.long_connection.is_none() {
-            let endpoint = self.websocket_endpoint()?;
+            let endpoint = self.websocket_endpoint().await?;
             self.long_connection = Some(FeishuLongConnection::connect(&endpoint).await?);
         }
         Ok(self
@@ -426,11 +395,13 @@ impl FeishuChannel {
 
         let mut envelope = parsed.envelope;
         if !parsed.attachments.is_empty() {
-            let attachments = self.download_attachments(
-                &parsed.attachments,
-                envelope.conversation_id.as_str(),
-                &parsed.message_id,
-            )?;
+            let attachments = self
+                .download_attachments(
+                    &parsed.attachments,
+                    envelope.conversation_id.as_str(),
+                    &parsed.message_id,
+                )
+                .await?;
             envelope.message.attachments = attachments;
         }
         Ok(Some(envelope))
@@ -459,16 +430,35 @@ impl Channel for FeishuChannel {
         let receive_id = env.conversation_id.as_str();
         let text = env.message.content.as_ref();
         if !text.is_empty() {
-            self.send_text(receive_id, text)?;
+            self.send_text(receive_id, text).await?;
         }
         for attachment in &env.message.attachments {
-            self.send_attachment(receive_id, attachment)?;
+            self.send_attachment(receive_id, attachment).await?;
         }
         if text.is_empty() && env.message.attachments.is_empty() {
-            return self.send_text(receive_id, "");
+            return self.send_text(receive_id, "").await;
         }
         Ok(())
     }
+}
+
+async fn post_json(url: &str, bearer: Option<&str>, body: &Value) -> Result<Value, ChannelError> {
+    let mut request = shared_client().post(url).json(body);
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    request
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(reqwest_to_channel_err)?
+        .json()
+        .await
+        .map_err(reqwest_to_channel_err)
+}
+
+fn reqwest_to_channel_err(err: reqwest::Error) -> ChannelError {
+    ChannelError::Backend(Arc::from(err.to_string()))
 }
 
 fn unix_now() -> Result<u64, ChannelError> {

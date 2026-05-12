@@ -1,0 +1,17 @@
+//! Built-in tools available to the runtime. Each tool lives in its own
+//! submodule. Cross-cutting helpers (workspace-root resolution,
+//! path-traversal guards, default cron / skills directories, test fixtures)
+//! sit in [`common`].
+
+mod common;
+mod cron;
+mod file;
+mod http;
+mod shell;
+mod skill_create;
+
+pub use cron::{CronCreatorTool, CronListTool, CronRemoveTool};
+pub use file::FileTool;
+pub use http::HttpTool;
+pub use shell::ShellTool;
+pub use skill_create::SkillCreatorTool;

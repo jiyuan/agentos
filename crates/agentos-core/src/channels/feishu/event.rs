@@ -310,18 +310,6 @@ fn extend_allowed_source_ids(values: &mut Vec<Arc<str>>, raw: Option<String>) {
     }
 }
 
-pub(super) fn curl_failure_message(stdout: &[u8], stderr: &[u8]) -> String {
-    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
-    if !stderr.is_empty() {
-        return stderr;
-    }
-    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
-    if !stdout.is_empty() {
-        return stdout;
-    }
-    "curl command failed".to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

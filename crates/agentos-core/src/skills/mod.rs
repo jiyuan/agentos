@@ -1,7 +1,9 @@
+mod planner;
 mod skill_creator;
 mod web_research;
 mod workspace;
 
+pub use planner::{builtin_skill_planners, SkillPlanner};
 pub use skill_creator::SkillCreatorSkill;
 pub use web_research::WebResearchSkill;
 pub use workspace::{

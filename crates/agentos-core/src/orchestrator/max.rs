@@ -6,7 +6,7 @@ use super::routing::{
 use crate::memory::{
     memory_caller_from_context, HydrationRequest, MemoryManager, MemoryStore, RetrievalStrategy,
 };
-use crate::skills::{SkillCreatorSkill, WebResearchSkill, WorkspaceSkillCatalog};
+use crate::skills::{builtin_skill_planners, SkillPlanner, WorkspaceSkillCatalog};
 use agentos_interfaces::orchestrator::{
     DispatchPriority, Orchestrator, OrchestratorError, Plan, ResourceEntry, ResourceIndex,
     ResourceKind, RoutingRule, RoutingTable, RunContext,
@@ -28,6 +28,7 @@ pub struct MaxOrchestrator {
     llm: Option<Arc<dyn Llm>>,
     memory_hydrator: Option<MemoryHydrator>,
     skill_catalog: WorkspaceSkillCatalog,
+    skill_planners: Vec<Arc<dyn SkillPlanner>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +74,7 @@ impl MaxOrchestrator {
             llm: None,
             memory_hydrator: None,
             skill_catalog: WorkspaceSkillCatalog::default(),
+            skill_planners: Vec::new(),
         }
     }
 
@@ -101,6 +103,10 @@ impl MaxOrchestrator {
     }
 
     pub fn with_skill_catalog(mut self, skill_catalog: WorkspaceSkillCatalog) -> Self {
+        // Re-derive the deterministic planner registry whenever the catalog
+        // changes — each planner gates on `catalog.contains(name)` so an
+        // empty / narrowed catalog produces silent no-ops in the chain.
+        self.skill_planners = builtin_skill_planners(skill_catalog.clone());
         self.skill_catalog = skill_catalog;
         self
     }
@@ -294,11 +300,15 @@ impl MaxOrchestrator {
         ctx: &RunContext<'_>,
         allow_routing_fallback: bool,
     ) -> Result<Plan, OrchestratorError> {
-        if let Some(plan) = WebResearchSkill::new(&self.skill_catalog).plan(ctx)? {
-            return Ok(plan);
-        }
-        if let Some(plan) = SkillCreatorSkill::new(&self.skill_catalog).plan(ctx)? {
-            return Ok(plan);
+        // Walk the deterministic planner registry. Each planner is gated on
+        // its own skill being in the catalog, so a narrowed sub-agent
+        // catalog produces silent no-ops here. Adding a new built-in skill
+        // is now a registration change in `skills/planner.rs`, no edits to
+        // this orchestrator.
+        for planner in &self.skill_planners {
+            if let Some(plan) = planner.plan(ctx)? {
+                return Ok(plan);
+            }
         }
 
         let Some(item) = ctx.state.transcript.items.last() else {

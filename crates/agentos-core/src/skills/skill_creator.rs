@@ -6,22 +6,28 @@
 //! LLM, which sees `skill_create` in its tools schema and can call it
 //! directly.
 
-use super::WorkspaceSkillCatalog;
+use super::{SkillPlanner, WorkspaceSkillCatalog};
 use agentos_interfaces::orchestrator::{OrchestratorError, Plan, RunContext};
 use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
 use serde_json::{json, value::RawValue, Value};
 use std::sync::Arc;
 
-pub struct SkillCreatorSkill<'a> {
-    catalog: &'a WorkspaceSkillCatalog,
+pub struct SkillCreatorSkill {
+    catalog: WorkspaceSkillCatalog,
 }
 
-impl<'a> SkillCreatorSkill<'a> {
-    pub fn new(catalog: &'a WorkspaceSkillCatalog) -> Self {
+impl SkillCreatorSkill {
+    pub fn new(catalog: WorkspaceSkillCatalog) -> Self {
         Self { catalog }
     }
+}
 
-    pub fn plan(&self, ctx: &RunContext<'_>) -> Result<Option<Plan>, OrchestratorError> {
+impl SkillPlanner for SkillCreatorSkill {
+    fn name(&self) -> &str {
+        "skill-creator"
+    }
+
+    fn plan(&self, ctx: &RunContext<'_>) -> Result<Option<Plan>, OrchestratorError> {
         if !self.catalog.contains("skill-creator") {
             return Ok(None);
         }
@@ -29,52 +35,49 @@ impl<'a> SkillCreatorSkill<'a> {
             return Ok(None);
         };
         match item.message.role {
-            MessageRole::User => self.plan_create(&item.message.content),
-            MessageRole::Tool => self.plan_acknowledgement(ctx),
+            MessageRole::User => plan_create(&item.message.content),
+            MessageRole::Tool => plan_acknowledgement(ctx),
             MessageRole::Assistant | MessageRole::System => Ok(None),
         }
     }
+}
 
-    fn plan_create(&self, input: &str) -> Result<Option<Plan>, OrchestratorError> {
-        let Some(parsed) = parse_create_prefix(input) else {
-            return Ok(None);
-        };
-        let mut args = json!({
-            "name": parsed.name,
-            "description": parsed.description,
-        });
-        if !parsed.resources.is_empty() {
-            args["resources"] = Value::from(parsed.resources.clone());
-        }
-        let raw_args = RawValue::from_string(args.to_string())
-            .map_err(|err| OrchestratorError::Backend(err.to_string().into()))?;
-        Ok(Some(Plan::CallTool(ToolCall {
-            id: ToolCallId::new(format!("skill-creator-{}", parsed.name)),
-            name: Arc::from("skill_create"),
-            args: raw_args,
-        })))
+fn plan_create(input: &str) -> Result<Option<Plan>, OrchestratorError> {
+    let Some(parsed) = parse_create_prefix(input) else {
+        return Ok(None);
+    };
+    let mut args = json!({
+        "name": parsed.name,
+        "description": parsed.description,
+    });
+    if !parsed.resources.is_empty() {
+        args["resources"] = Value::from(parsed.resources.clone());
     }
+    let raw_args = RawValue::from_string(args.to_string())
+        .map_err(|err| OrchestratorError::Backend(err.to_string().into()))?;
+    Ok(Some(Plan::CallTool(ToolCall {
+        id: ToolCallId::new(format!("skill-creator-{}", parsed.name)),
+        name: Arc::from("skill_create"),
+        args: raw_args,
+    })))
+}
 
-    fn plan_acknowledgement(
-        &self,
-        ctx: &RunContext<'_>,
-    ) -> Result<Option<Plan>, OrchestratorError> {
-        if !previous_user_requested_skill_create(ctx) {
-            return Ok(None);
-        }
-        let Some(item) = ctx.state.transcript.items.last() else {
-            return Ok(None);
-        };
-        // Echo the tool's success message back as the assistant reply so the
-        // run can complete without a second LLM round-trip when the prefix
-        // shortcut is used. Natural-language requests skip this branch
-        // because `previous_user_requested_skill_create` only matches the
-        // explicit `create skill:` prefix.
-        Ok(Some(Plan::Reply(Message::text(
-            MessageRole::Assistant,
-            Arc::clone(&item.message.content),
-        ))))
+fn plan_acknowledgement(ctx: &RunContext<'_>) -> Result<Option<Plan>, OrchestratorError> {
+    if !previous_user_requested_skill_create(ctx) {
+        return Ok(None);
     }
+    let Some(item) = ctx.state.transcript.items.last() else {
+        return Ok(None);
+    };
+    // Echo the tool's success message back as the assistant reply so the
+    // run can complete without a second LLM round-trip when the prefix
+    // shortcut is used. Natural-language requests skip this branch
+    // because `previous_user_requested_skill_create` only matches the
+    // explicit `create skill:` prefix.
+    Ok(Some(Plan::Reply(Message::text(
+        MessageRole::Assistant,
+        Arc::clone(&item.message.content),
+    ))))
 }
 
 #[derive(Debug, PartialEq)]

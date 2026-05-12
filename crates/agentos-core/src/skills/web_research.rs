@@ -1,19 +1,25 @@
-use super::WorkspaceSkillCatalog;
+use super::{SkillPlanner, WorkspaceSkillCatalog};
 use agentos_interfaces::orchestrator::{OrchestratorError, Plan, RunContext};
 use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
 use serde_json::{json, value::RawValue};
 use std::sync::Arc;
 
-pub struct WebResearchSkill<'a> {
-    catalog: &'a WorkspaceSkillCatalog,
+pub struct WebResearchSkill {
+    catalog: WorkspaceSkillCatalog,
 }
 
-impl<'a> WebResearchSkill<'a> {
-    pub fn new(catalog: &'a WorkspaceSkillCatalog) -> Self {
+impl WebResearchSkill {
+    pub fn new(catalog: WorkspaceSkillCatalog) -> Self {
         Self { catalog }
     }
+}
 
-    pub fn plan(&self, ctx: &RunContext<'_>) -> Result<Option<Plan>, OrchestratorError> {
+impl SkillPlanner for WebResearchSkill {
+    fn name(&self) -> &str {
+        "web-research"
+    }
+
+    fn plan(&self, ctx: &RunContext<'_>) -> Result<Option<Plan>, OrchestratorError> {
         if !self.catalog.contains("web-research") {
             return Ok(None);
         }
@@ -22,18 +28,17 @@ impl<'a> WebResearchSkill<'a> {
         };
 
         match item.message.role {
-            MessageRole::User => self.plan_fetch(&item.message.content),
-            MessageRole::Tool => self.plan_summary(ctx),
+            MessageRole::User => plan_fetch(&item.message.content),
+            MessageRole::Tool => plan_summary(ctx),
             MessageRole::Assistant | MessageRole::System => Ok(None),
         }
     }
+}
 
-    fn plan_fetch(&self, input: &str) -> Result<Option<Plan>, OrchestratorError> {
-        let lower = input.to_ascii_lowercase();
-        let url = if lower.contains("summarize")
-            && lower.contains("top")
-            && lower.contains("hacker news")
-        {
+fn plan_fetch(input: &str) -> Result<Option<Plan>, OrchestratorError> {
+    let lower = input.to_ascii_lowercase();
+    let url =
+        if lower.contains("summarize") && lower.contains("top") && lower.contains("hacker news") {
             "https://news.ycombinator.com/news"
         } else if let Some(url) = input.strip_prefix("web research:") {
             url.trim()
@@ -43,30 +48,29 @@ impl<'a> WebResearchSkill<'a> {
             return Ok(None);
         };
 
-        Ok(Some(raw_tool_plan(
-            "http",
-            "web-research-fetch-1",
-            json!({
-                "method": "GET",
-                "url": url
-            }),
-        )?))
+    Ok(Some(raw_tool_plan(
+        "http",
+        "web-research-fetch-1",
+        json!({
+            "method": "GET",
+            "url": url
+        }),
+    )?))
+}
+
+fn plan_summary(ctx: &RunContext<'_>) -> Result<Option<Plan>, OrchestratorError> {
+    if !previous_user_requested_web_research(ctx) {
+        return Ok(None);
     }
 
-    fn plan_summary(&self, ctx: &RunContext<'_>) -> Result<Option<Plan>, OrchestratorError> {
-        if !previous_user_requested_web_research(ctx) {
-            return Ok(None);
-        }
-
-        let Some(item) = ctx.state.transcript.items.last() else {
-            return Ok(None);
-        };
-        let summary = summarize_research_result(&item.message.content);
-        Ok(Some(Plan::Reply(Message::text(
-            MessageRole::Assistant,
-            summary,
-        ))))
-    }
+    let Some(item) = ctx.state.transcript.items.last() else {
+        return Ok(None);
+    };
+    let summary = summarize_research_result(&item.message.content);
+    Ok(Some(Plan::Reply(Message::text(
+        MessageRole::Assistant,
+        summary,
+    ))))
 }
 
 fn raw_tool_plan(

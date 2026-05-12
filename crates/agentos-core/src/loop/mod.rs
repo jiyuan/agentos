@@ -1,30 +1,34 @@
-use crate::approve::{tool_call_approval_id, Policy, PolicyDecision};
+use crate::approve::Policy;
 use crate::hooks::Hooks;
-use crate::subagents::{SubAgentError, SubAgentRegistry, SubAgentRunOutput};
+use crate::subagents::{SubAgentError, SubAgentRegistry};
 use crate::task_workspace::{TaskWorkspace, TaskWorkspaceError};
 use crate::tools::{ToolRegistry, ToolRegistryError};
 use crate::trace;
 use agentos_interfaces::guardrail::{
     GuardrailError, GuardrailOutcome, Input, InputGuardrail, OutputGuardrail, ToolGuardrail,
 };
-use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext, SubOrchSpec};
-use agentos_interfaces::run_state::{ApprovalStatus, Interruption, InterruptionAction, RunState};
-use agentos_interfaces::session::Item;
-use agentos_proto::{
-    AgentId, InterruptionId, Message, MessageRole, SpanKind, ToolCall, ToolResult, ToolStatus,
-};
+use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext};
+use agentos_interfaces::run_state::{InterruptionAction, RunState};
+use agentos_proto::{AgentId, Message, SpanKind, ToolCall, ToolResult, ToolStatus};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
 
+mod approval;
 mod delegate;
 mod escalate;
+mod items;
 mod telemetry;
 
+use approval::{approve_transition, ApproveTransition};
 use delegate::execute_delegate;
 use escalate::execute_escalate;
+use items::{
+    assistant_tool_call_item, metadata_value, subagent_result_item, suborchestrator_result_item,
+    tool_result_item, tool_status_name,
+};
 use telemetry::{plan_assignment_fields, record_telemetry_event};
 
 #[derive(Debug, Error)]
@@ -305,85 +309,6 @@ async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, R
     }
 }
 
-enum ApproveTransition {
-    Allow {
-        state: RunState,
-        plan: Plan,
-        turns: usize,
-    },
-    Deny {
-        reason: Arc<str>,
-    },
-    Pause {
-        state: RunState,
-    },
-    Unsupported {
-        reason: Arc<str>,
-    },
-}
-
-fn approve_transition(ctx: ApproveCtx, policy: &Policy) -> ApproveTransition {
-    match policy.decide(&ctx.plan) {
-        PolicyDecision::Allow => ApproveTransition::Allow {
-            state: ctx.state,
-            plan: ctx.plan,
-            turns: ctx.turns,
-        },
-        PolicyDecision::Deny { reason } => ApproveTransition::Deny { reason },
-        PolicyDecision::AskUser { reason } => pause_for_approval(ctx, reason),
-    }
-}
-
-fn pause_for_approval(ctx: ApproveCtx, reason: Arc<str>) -> ApproveTransition {
-    let (approval_id, action) = match ctx.plan {
-        Plan::CallTool(call) => (
-            tool_call_approval_id(&call),
-            InterruptionAction::ToolCall(call),
-        ),
-        Plan::Delegate(spec) => (
-            delegate_approval_id(&spec),
-            InterruptionAction::Delegate(spec),
-        ),
-        Plan::Escalate(spec) => (
-            escalate_approval_id(&spec),
-            InterruptionAction::Escalate(spec),
-        ),
-        Plan::Handoff(agent_id, payload) => (
-            handoff_approval_id(&agent_id),
-            InterruptionAction::Handoff { agent_id, payload },
-        ),
-        Plan::Reply(_) => return ApproveTransition::Unsupported { reason },
-    };
-
-    let mut state = ctx.state;
-    state.pending_approvals.push(Interruption {
-        id: InterruptionId::new(approval_id),
-        action,
-        status: ApprovalStatus::Pending,
-    });
-    ApproveTransition::Pause { state }
-}
-
-fn delegate_approval_id(spec: &agentos_interfaces::orchestrator::SubAgentSpec) -> Arc<str> {
-    Arc::from(format!(
-        "approval-delegate-{}-{}",
-        spec.agent_id.as_str(),
-        spec.policy_id
-    ))
-}
-
-fn handoff_approval_id(agent_id: &agentos_proto::AgentId) -> Arc<str> {
-    Arc::from(format!("approval-handoff-{}", agent_id.as_str()))
-}
-
-fn escalate_approval_id(spec: &SubOrchSpec) -> Arc<str> {
-    Arc::from(format!(
-        "approval-escalate-{}-{}",
-        spec.template.name,
-        spec.task_id.as_str()
-    ))
-}
-
 async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError> {
     let mut state = ctx.state;
     match ctx.plan {
@@ -394,11 +319,11 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
             // tool_call's id.
             state.transcript.items.push(assistant_tool_call_item(&call));
             let result = execute_tool(&mut state, deps, call).await?;
-            state.transcript.items.push(tool_result_item(&result));
+            state.transcript.items.push(tool_result_item(result));
         }
         Plan::Delegate(spec) => {
             let result = execute_delegate(&mut state, deps, &spec).await?;
-            state.transcript.items.push(subagent_result_item(&result));
+            state.transcript.items.push(subagent_result_item(result));
         }
         Plan::Escalate(spec) => {
             let result = execute_escalate(&mut state, deps, &spec).await?;
@@ -428,14 +353,8 @@ fn execute_handoff(
     let from_agent = state.active_agent.clone();
     let parent_id = trace::run_span_id(state);
     let mut fields = BTreeMap::new();
-    fields.insert(
-        Arc::from("from_agent"),
-        Value::String(from_agent.as_str().to_owned()),
-    );
-    fields.insert(
-        Arc::from("to_agent"),
-        Value::String(agent_id.as_str().to_owned()),
-    );
+    fields.insert(Arc::from("from_agent"), metadata_value(from_agent.as_str()));
+    fields.insert(Arc::from("to_agent"), metadata_value(agent_id.as_str()));
     if let Some(payload) = payload {
         fields.insert(Arc::from("payload"), payload);
     }
@@ -459,7 +378,7 @@ fn execute_handoff(
     let mut fields = BTreeMap::new();
     fields.insert(
         Arc::from("active_agent"),
-        Value::String(state.active_agent.as_str().to_owned()),
+        metadata_value(state.active_agent.as_str()),
     );
     trace::record_event(state, deps.hooks, span_id, "handoff_finished", fields);
 }
@@ -478,14 +397,8 @@ async fn execute_tool(
 ) -> Result<ToolResult, RunError> {
     let parent_id = trace::run_span_id(state);
     let mut fields = BTreeMap::new();
-    fields.insert(
-        Arc::from("tool_name"),
-        Value::String(call.name.as_ref().to_owned()),
-    );
-    fields.insert(
-        Arc::from("tool_call_id"),
-        Value::String(call.id.as_str().to_owned()),
-    );
+    fields.insert(Arc::from("tool_name"), metadata_value(call.name.as_ref()));
+    fields.insert(Arc::from("tool_call_id"), metadata_value(call.id.as_str()));
     let tool_span_id = trace::record_span(
         state,
         parent_id,
@@ -542,7 +455,7 @@ async fn execute_tool(
     let mut fields = BTreeMap::new();
     fields.insert(
         Arc::from("status"),
-        Value::String(tool_status_name(&result.status).to_owned()),
+        metadata_value(tool_status_name(&result.status)),
     );
     trace::record_event(state, deps.hooks, tool_span_id, "tool_finished", fields);
     Ok(result)
@@ -555,135 +468,6 @@ fn ensure_guardrail_passed(name: &Arc<str>, outcome: GuardrailOutcome) -> Result
             guardrail: Arc::clone(name),
             reason,
         }),
-    }
-}
-
-fn tool_result_item(result: &ToolResult) -> Item {
-    let mut metadata = result.metadata.clone();
-    metadata.insert(
-        Arc::from("tool_call_id"),
-        Value::String(result.call_id.as_str().to_owned()),
-    );
-    metadata.insert(
-        Arc::from("tool_status"),
-        Value::String(tool_status_name(&result.status).to_owned()),
-    );
-    Item {
-        message: Message {
-            role: MessageRole::Tool,
-            content: Arc::clone(&result.content),
-            attachments: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: Some(result.call_id.clone()),
-            metadata,
-        },
-        metadata: BTreeMap::new(),
-    }
-}
-
-fn assistant_tool_call_item(call: &ToolCall) -> Item {
-    let mut metadata = BTreeMap::new();
-    metadata.insert(Arc::from("kind"), Value::String("tool_call".to_owned()));
-    metadata.insert(
-        Arc::from("tool_call_id"),
-        Value::String(call.id.as_str().to_owned()),
-    );
-    metadata.insert(
-        Arc::from("tool_name"),
-        Value::String(call.name.as_ref().to_owned()),
-    );
-    Item {
-        message: Message {
-            role: MessageRole::Assistant,
-            content: Arc::from(""),
-            attachments: Vec::new(),
-            tool_calls: vec![call.clone()],
-            tool_call_id: None,
-            metadata: BTreeMap::new(),
-        },
-        metadata,
-    }
-}
-
-fn subagent_result_item(result: &SubAgentRunOutput) -> Item {
-    let mut metadata = BTreeMap::new();
-    metadata.insert(
-        Arc::from("kind"),
-        Value::String("subagent_result".to_owned()),
-    );
-    metadata.insert(
-        Arc::from("subagent_id"),
-        Value::String(result.agent_id.as_str().to_owned()),
-    );
-    metadata.insert(
-        Arc::from("policy_id"),
-        Value::String(result.policy_id.as_ref().to_owned()),
-    );
-    metadata.insert(
-        Arc::from("child_run_id"),
-        Value::String(result.state.run_id.as_str().to_owned()),
-    );
-    Item {
-        message: Message {
-            role: MessageRole::Tool,
-            content: Arc::clone(&result.message.content),
-            attachments: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            metadata,
-        },
-        metadata: BTreeMap::new(),
-    }
-}
-
-fn suborchestrator_result_item(
-    spec: &SubOrchSpec,
-    results: Vec<(Arc<str>, SubAgentRunOutput)>,
-) -> Item {
-    let mut metadata = BTreeMap::new();
-    metadata.insert(
-        Arc::from("kind"),
-        Value::String("suborchestrator_result".to_owned()),
-    );
-    metadata.insert(
-        Arc::from("template"),
-        Value::String(spec.template.name.as_ref().to_owned()),
-    );
-    metadata.insert(
-        Arc::from("task_id"),
-        Value::String(spec.task_id.as_str().to_owned()),
-    );
-    metadata.insert(Arc::from("stages"), Value::from(results.len()));
-    let content = if results.is_empty() {
-        format!(
-            "sub-orchestrator '{}' completed with no stages",
-            spec.template.name
-        )
-    } else {
-        results
-            .iter()
-            .map(|(stage, result)| format!("{}: {}", stage, result.message.content))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    Item {
-        message: Message {
-            role: MessageRole::Tool,
-            content: Arc::from(content),
-            attachments: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            metadata,
-        },
-        metadata: BTreeMap::new(),
-    }
-}
-
-fn tool_status_name(status: &ToolStatus) -> &'static str {
-    match status {
-        ToolStatus::Succeeded => "succeeded",
-        ToolStatus::Failed => "failed",
-        ToolStatus::Denied => "denied",
     }
 }
 
