@@ -182,8 +182,18 @@ impl AgentRuntime {
         // Skill catalog must be loaded before sub-agents are built so sub-agent
         // MaxOrchestrators can hold a clone of it and dispatch skills (e.g.
         // web-research, skill-creator).
+        let resolved_skills_root = skills_root(&paths.agent_config_path);
+        // Pin `AGENTOS_SKILLS_DIR` to the same absolute path the loader uses,
+        // so the `skill_create` tool's `default_skills_dir` resolves to the
+        // same directory regardless of the gateway process's CWD. Without
+        // this, the tool would write to `<cwd>/workspace/skills` while the
+        // loader reads from `<agent_config_dir>/skills`, and freshly created
+        // skills appear to vanish.
+        if std::env::var_os("AGENTOS_SKILLS_DIR").is_none() {
+            std::env::set_var("AGENTOS_SKILLS_DIR", &resolved_skills_root);
+        }
         let skill_catalog = WorkspaceSkillCatalog::load_enabled(
-            &skills_root(&paths.agent_config_path),
+            &resolved_skills_root,
             &workspace_config.resources.skills.enabled,
         )
         .map_err(|err| format!("failed to load workspace skills: {err}"))?;

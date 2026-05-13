@@ -1,11 +1,12 @@
 use super::common::{default_skills_dir, elapsed_ms, result_metadata, skills_root_for_tests};
-use crate::skills::{create_skill, SkillCreation, SkillResourceKind};
+use crate::skills::{create_skill, SkillBundleFile, SkillCreation, SkillResourceKind};
 use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, value::RawValue};
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -27,6 +28,26 @@ struct SkillCreateArgs {
     description: String,
     #[serde(default)]
     resources: Vec<String>,
+    /// Optional Markdown body for SKILL.md (without the YAML frontmatter
+    /// — the tool rebuilds the frontmatter from `name` + `description`).
+    /// Use this to produce a complete SKILL.md in one tool call rather
+    /// than scaffolding and then editing.
+    #[serde(default)]
+    body: Option<String>,
+    /// Optional bundle files to write under the skill directory. Each
+    /// path is relative to the skill directory, may not contain `..`,
+    /// and may not be the literal `SKILL.md` (use `body` for that).
+    /// Lets the LLM produce scripts/, references/, and assets/ contents
+    /// in the same call.
+    #[serde(default)]
+    files: Vec<SkillCreateFileArgs>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillCreateFileArgs {
+    path: String,
+    content: String,
 }
 
 #[async_trait]
@@ -35,11 +56,15 @@ impl Tool for SkillCreatorTool {
         ToolSpec {
             name: Arc::from("skill_create"),
             description: Arc::from(
-                "Scaffold a new workspace skill following the Anthropic \
-                 SKILL.md folder format. Creates workspace/skills/<name>/SKILL.md \
-                 with YAML frontmatter and an optional set of bundled resource \
-                 directories (scripts, references, assets). Validates the \
-                 result before returning.",
+                "Create a complete workspace skill in one call. Writes \
+                 workspace/skills/<name>/SKILL.md (with YAML frontmatter \
+                 rebuilt from `name` + `description`), creates the requested \
+                 resource subdirectories (scripts, references, assets), and \
+                 writes any extra bundle files passed in `files`. Prefer one \
+                 atomic call with `body` and `files` over scaffolding and then \
+                 editing — the tool validates the SKILL.md shape before \
+                 returning, so a successful result means the full bundle is \
+                 on disk.",
             ),
             input_schema: json!({
                 "type": "object",
@@ -57,6 +82,22 @@ impl Tool for SkillCreatorTool {
                         "type": "array",
                         "items": { "type": "string", "enum": ["scripts", "references", "assets"] },
                         "description": "Optional bundled resource subdirectories to create."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional Markdown body for SKILL.md (no frontmatter — the tool rebuilds it). When omitted, a placeholder scaffold is written and the agent is expected to follow up with edits."
+                    },
+                    "files": {
+                        "type": "array",
+                        "description": "Optional bundle files to write inside the skill directory in the same call. Each item has a relative `path` (no '..'; not the literal 'SKILL.md') and `content` string.",
+                        "items": {
+                            "type": "object",
+                            "required": ["path", "content"],
+                            "properties": {
+                                "path": { "type": "string" },
+                                "content": { "type": "string" }
+                            }
+                        }
                     }
                 }
             }),
@@ -84,16 +125,37 @@ impl Tool for SkillCreatorTool {
             resources.insert(kind);
         }
 
+        let files = parsed
+            .files
+            .into_iter()
+            .map(|file| SkillBundleFile {
+                path: PathBuf::from(file.path),
+                content: Arc::from(file.content),
+            })
+            .collect::<Vec<_>>();
+        let file_count = files.len();
+
         let creation = SkillCreation {
             name: Arc::from(parsed.name.as_str()),
             description: Arc::from(parsed.description.as_str()),
             resources,
+            body: parsed.body.as_deref().map(Arc::from),
+            files,
         };
         let root = skills_root_for_tests().unwrap_or_else(default_skills_dir);
         let skill = create_skill(&root, &creation)
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
 
-        let message = format!("created skill '{}' at {}", skill.name, skill.path.display());
+        let message = if file_count == 0 {
+            format!("created skill '{}' at {}", skill.name, skill.path.display())
+        } else {
+            format!(
+                "created skill '{}' at {} with {file_count} bundle file{}",
+                skill.name,
+                skill.path.display(),
+                if file_count == 1 { "" } else { "s" }
+            )
+        };
         let bytes_out = message.len() as u64;
         Ok(ToolResult {
             call_id: call.id.clone(),
@@ -167,5 +229,124 @@ mod tests {
             .unwrap_err();
         let ToolError::Failed(msg) = err;
         assert!(msg.contains("unknown resource kind"));
+    }
+
+    #[tokio::test]
+    async fn skill_creator_tool_writes_body_and_bundle_files_atomically() {
+        // One tool call produces a complete bundle — SKILL.md with the
+        // caller-supplied body, plus three bundle files at the requested
+        // paths. This is the path the upgraded skill-creator workflow
+        // depends on: no follow-up file writes needed.
+        let guard = SkillsDirGuard::new("skill-creator-bundle");
+        let args = json!({
+            "name": "audit-skill",
+            "description": "Pushy description for triggering.",
+            "resources": ["scripts", "references"],
+            "body": "# Audit Skill\n\nThis is the body.\n",
+            "files": [
+                { "path": "scripts/run.py", "content": "print('hi')\n" },
+                { "path": "references/notes.md", "content": "Notes.\n" },
+                { "path": "scripts/lib/util.py", "content": "x = 1\n" }
+            ],
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let result = SkillCreatorTool
+            .call(&tool_call("skill_create", "bundle"), &raw)
+            .await
+            .unwrap();
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        assert!(result.content.contains("3 bundle files"));
+
+        let skill_dir = guard.dir.join("audit-skill");
+        let skill_md = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(skill_md.contains("name: audit-skill"));
+        assert!(skill_md.contains("Pushy description for triggering."));
+        assert!(skill_md.contains("# Audit Skill"));
+        assert!(skill_md.contains("This is the body."));
+        // Default scaffold text must NOT leak in when body is supplied.
+        assert!(!skill_md.contains("Describe the repeatable workflow"));
+
+        let run_py = std::fs::read_to_string(skill_dir.join("scripts").join("run.py")).unwrap();
+        assert_eq!(run_py, "print('hi')\n");
+        let notes_md =
+            std::fs::read_to_string(skill_dir.join("references").join("notes.md")).unwrap();
+        assert_eq!(notes_md, "Notes.\n");
+        // Nested path creates intermediate dirs.
+        let util_py =
+            std::fs::read_to_string(skill_dir.join("scripts").join("lib").join("util.py")).unwrap();
+        assert_eq!(util_py, "x = 1\n");
+    }
+
+    #[tokio::test]
+    async fn skill_creator_tool_rejects_parent_dir_traversal_in_bundle_path() {
+        let guard = SkillsDirGuard::new("skill-creator-traverse");
+        let args = json!({
+            "name": "escape-skill",
+            "description": "Tries to climb out.",
+            "files": [
+                { "path": "../escaped.txt", "content": "nope" }
+            ],
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let err = SkillCreatorTool
+            .call(&tool_call("skill_create", "traverse"), &raw)
+            .await
+            .unwrap_err();
+        let ToolError::Failed(msg) = err;
+        assert!(
+            msg.contains("'..'"),
+            "expected traversal rejection, got: {msg}"
+        );
+        // The skill_dir must not exist — failure happens mid-write and the
+        // bundle write step is reached only after SKILL.md, so the skill
+        // dir may be partially populated. The important guarantee is that
+        // nothing landed outside the guard's tmpdir.
+        let escaped = guard.dir.parent().unwrap().join("escaped.txt");
+        assert!(!escaped.exists());
+    }
+
+    #[tokio::test]
+    async fn skill_creator_tool_rejects_absolute_bundle_path() {
+        let _guard = SkillsDirGuard::new("skill-creator-absolute");
+        let args = json!({
+            "name": "absolute-skill",
+            "description": "Tries an absolute write.",
+            "files": [
+                { "path": "/tmp/agentos-pwn.txt", "content": "nope" }
+            ],
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let err = SkillCreatorTool
+            .call(&tool_call("skill_create", "absolute"), &raw)
+            .await
+            .unwrap_err();
+        let ToolError::Failed(msg) = err;
+        assert!(
+            msg.contains("relative"),
+            "expected absolute-path rejection, got: {msg}"
+        );
+        assert!(!std::path::Path::new("/tmp/agentos-pwn.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn skill_creator_tool_rejects_skill_md_in_files() {
+        let _guard = SkillsDirGuard::new("skill-creator-skillmd");
+        let args = json!({
+            "name": "shadow-skill",
+            "description": "Tries to shadow SKILL.md.",
+            "files": [
+                { "path": "SKILL.md", "content": "---\nname: shadow\n---\n" }
+            ],
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let err = SkillCreatorTool
+            .call(&tool_call("skill_create", "shadow"), &raw)
+            .await
+            .unwrap_err();
+        let ToolError::Failed(msg) = err;
+        assert!(
+            msg.contains("body"),
+            "expected pointer to body field, got: {msg}"
+        );
     }
 }

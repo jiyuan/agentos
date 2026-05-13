@@ -50,28 +50,61 @@ Proactively ask about edge cases, example inputs, success criteria, and dependen
 
 ### Write the SKILL.md
 
-The local scaffold tool produces the skeleton, then you edit it. From inside the workspace agent:
+The built-in `skill_create` tool is a **one-shot bundle producer** — when it succeeds, the full skill is on disk. Always call it with the complete contents you want; do not call it with just `name`+`description` and then plan a follow-up edit pass.
+
+Schema:
+
+- `name` *(required)* — lowercase hyphen-case, max 64 chars.
+- `description` *(required)* — the triggering string, max 1024 chars, no `<` or `>`.
+- `resources` *(optional)* — array of `"scripts"`, `"references"`, `"assets"`. Creates the empty directories so the bundle layout is in place.
+- `body` *(optional)* — the Markdown body of `SKILL.md`. The tool rebuilds the YAML frontmatter from `name`+`description`, so do not include the `---` fences in `body`. When `body` is omitted you get a placeholder scaffold.
+- `files` *(optional)* — array of `{ "path": "<relative>", "content": "<string>" }`. Writes every entry inside the skill directory in the same call. Paths cannot be absolute, cannot contain `..`, and cannot be the literal `SKILL.md` (use `body` for that).
+
+The tool:
+
+- Normalises the name to lowercase hyphen-case.
+- Writes `workspace/skills/<name>/SKILL.md` with rebuilt frontmatter plus your `body`.
+- Creates each requested resource subdirectory.
+- Writes every `files[]` entry (creating intermediate directories as needed).
+- Sanitises every bundle path against traversal and canonical-escape (symlink) attacks.
+- Runs `validate_skill_dir` before returning. A `Succeeded` result means the bundle is on disk and parses.
+
+There is also a deterministic shortcut for trivial cases:
 
 ```text
 create skill: <skill-name>, <one-line description>, resources=scripts|references|assets
 ```
 
-That deterministic prefix calls the built-in `skill_create` tool, which:
+That prefix is intercepted by `SkillCreatorSkill` and produces a placeholder bundle (no `body`, no `files`). Use it only when you want a scaffold to edit later. **For real skills, always go through the tool with `body` and `files` filled in.**
 
-- Normalises the name to lowercase hyphen-case.
-- Creates `workspace/skills/<skill-name>/SKILL.md` with valid frontmatter.
-- Creates the requested resource subdirectories (any of `scripts`, `references`, `assets`).
-- Runs `validate_skill_dir` before returning, so you only see success if the result parses.
+Once `skill_create` returns, edit `SKILL.md` only if you discover something wrong with the body you already wrote — the bundle is otherwise complete.
 
-Natural-language requests also work — the LLM sees the `skill_create` tool in its tool schema and can call it directly.
+The `SKILL.md` you provide via `body` should specify:
 
-Once the skeleton exists, edit `SKILL.md` to fill in:
+- The first heading (`# Title`) — derived from `name` by convention.
+- An imperative, model-readable body. Keep it under ~500 lines; if it grows, push detail into `references/<topic>.md` (and include those files in the same `files[]` array) and link to them from the body.
+- `name` and `description` are written into the rebuilt frontmatter automatically — you don't put them in `body`.
 
-- **name** — Identifier in lowercase hyphen-case. Must match the directory name. Maximum 64 characters.
-- **description** — Triggering signal. State both *what* the skill does and *specific contexts where it should be used*. Don't put "when to use" info in the body — put it here. Maximum 1024 characters, no `<` or `>`.
-- **body** — Imperative, model-readable instructions. Keep it under ~500 lines; if it grows, push detail into `references/` and link from the body.
+Optional frontmatter fields supported by the upstream spec (and accepted by `scripts/quick_validate.py`): `license`, `allowed-tools`, `metadata`, `compatibility`. AgentOS itself reads `name` and `description`; extra fields are preserved verbatim and ignored by the loader. The current tool schema does not surface these — if you need them, write the SKILL.md by hand instead of going through `skill_create`.
 
-Optional frontmatter fields supported by the upstream spec (and accepted by `scripts/quick_validate.py`): `license`, `allowed-tools`, `metadata`, `compatibility`. AgentOS itself reads `name` and `description`; extra fields are preserved verbatim and ignored by the loader.
+#### Example: one-shot bundle call
+
+For an "audit-skill" that tracks the last 24 hours of model usage, a complete `skill_create` call looks like:
+
+```json
+{
+  "name": "audit-skill",
+  "description": "Summarize the last 24h of model token consumption, total model calls, task executions, and task success rate from the AgentOS run-state and trace logs. Use this skill whenever the user asks about model usage, token spend, audit numbers, daily activity stats, or 'what did the agent do today'.",
+  "resources": ["scripts", "references"],
+  "body": "# Audit Skill\n\n## Workflow\n\n1. Read trace files under `workspace/traces/`.\n2. Filter spans to the last 24h.\n3. Aggregate `tokens`, `tool_calls`, `task_id` counts, and success/failure status.\n4. Emit a Markdown summary with the four metrics.\n\nSee `scripts/aggregate.py` for the reusable aggregator. See `references/trace_shape.md` for the trace span schema.\n",
+  "files": [
+    { "path": "scripts/aggregate.py", "content": "#!/usr/bin/env python3\n# aggregator implementation here\n" },
+    { "path": "references/trace_shape.md", "content": "# Trace span shape\n\nDescribes the JSONL records under workspace/traces/.\n" }
+  ]
+}
+```
+
+That single call produces the full bundle. The result content (`created skill 'audit-skill' at workspace/skills/audit-skill with 2 bundle files`) confirms the file count, so you can sanity-check it from the assistant reply.
 
 #### Description writing — leaning toward "pushy"
 

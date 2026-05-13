@@ -31,6 +31,20 @@ pub struct SkillCreation {
     pub name: Arc<str>,
     pub description: Arc<str>,
     pub resources: BTreeSet<SkillResourceKind>,
+    /// Optional Markdown body for SKILL.md (without the YAML frontmatter
+    /// fence — the frontmatter is rebuilt from `name` + `description`).
+    /// When `None`, a scaffolded placeholder body is written.
+    pub body: Option<Arc<str>>,
+    /// Optional bundle files to write under the skill directory in the
+    /// same call. Paths must be relative, must not contain `..`, and
+    /// must canonicalise within the skill directory.
+    pub files: Vec<SkillBundleFile>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillBundleFile {
+    pub path: PathBuf,
+    pub content: Arc<str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -124,6 +138,8 @@ impl SkillCreation {
             name: Arc::from(normalize_skill_name(name.as_ref())),
             description: description.into(),
             resources: BTreeSet::new(),
+            body: None,
+            files: Vec::new(),
         }
     }
 
@@ -173,8 +189,115 @@ pub fn create_skill(
         })?;
     }
 
-    let title = creation
-        .name
+    let body = match creation.body.as_deref() {
+        Some(body) => body.to_owned(),
+        None => default_skill_body(&creation.name),
+    };
+    let content = format!(
+        "---\nname: {}\ndescription: {}\n---\n\n{}\n",
+        creation.name,
+        yaml_scalar(&creation.description),
+        body.trim_end()
+    );
+    let skill_file = skill_dir.join(SKILL_FILE);
+    fs::write(&skill_file, content).map_err(|source| SkillStoreError::Io {
+        path: skill_file,
+        source,
+    })?;
+
+    for file in &creation.files {
+        let target = resolve_bundle_path(&skill_dir, &file.path).map_err(|message| {
+            SkillStoreError::Invalid {
+                path: skill_dir.join(&file.path),
+                message,
+            }
+        })?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|source| SkillStoreError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        fs::write(&target, file.content.as_bytes()).map_err(|source| SkillStoreError::Io {
+            path: target,
+            source,
+        })?;
+    }
+
+    validate_skill_dir(&skill_dir)
+}
+
+/// Resolve `requested` against `skill_dir`, rejecting absolute paths,
+/// `..` components, the bare `SKILL.md` name (which is owned by the
+/// creator), and any canonical path that escapes the skill directory
+/// (e.g. via a pre-existing symlink). Returns the absolute target path
+/// the caller should write to.
+fn resolve_bundle_path(skill_dir: &Path, requested: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    if requested.as_os_str().is_empty() {
+        return Err("bundle file path is empty".to_owned());
+    }
+    if requested.is_absolute() {
+        return Err(format!(
+            "bundle file path '{}' must be relative to the skill directory",
+            requested.display()
+        ));
+    }
+    for component in requested.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(format!(
+                    "bundle file path '{}' may not contain '..' segments",
+                    requested.display()
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "bundle file path '{}' must be relative to the skill directory",
+                    requested.display()
+                ));
+            }
+        }
+    }
+    let target = skill_dir.join(requested);
+    if target.file_name() == Some(std::ffi::OsStr::new(SKILL_FILE))
+        && target.parent() == Some(skill_dir)
+    {
+        return Err(format!(
+            "bundle files cannot overwrite '{SKILL_FILE}'; use the `body` field instead"
+        ));
+    }
+    // Canonicalise the deepest existing ancestor so a pre-existing symlink
+    // inside `skill_dir` can't redirect the write. If no ancestor exists
+    // yet (fresh skill dir), the lexical checks above are sufficient.
+    let mut probe = target.as_path();
+    let canonical_anchor = loop {
+        match probe.canonicalize() {
+            Ok(path) => break Some(path),
+            Err(_) => match probe.parent() {
+                Some(parent) => probe = parent,
+                None => break None,
+            },
+        }
+    };
+    if let Some(canonical_anchor) = canonical_anchor {
+        let canonical_root = skill_dir
+            .canonicalize()
+            .map_err(|err| format!("skill directory canonicalize failed: {err}"))?;
+        if !canonical_anchor.starts_with(&canonical_root) {
+            return Err(format!(
+                "bundle file path '{}' resolves outside the skill directory",
+                requested.display()
+            ));
+        }
+    }
+    Ok(target)
+}
+
+fn default_skill_body(name: &str) -> String {
+    let title = name
         .split('-')
         .map(|part| {
             let mut chars = part.chars();
@@ -185,19 +308,9 @@ pub fn create_skill(
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let content = format!(
-        "---\nname: {}\ndescription: {}\n---\n\n# {}\n\n## Workflow\n\nDescribe the repeatable workflow this skill standardizes. Keep the core instructions here and move detailed references, deterministic scripts, or reusable assets into bundled resource directories.\n\n## Validation\n\nRun `agentos skill validate {}` after editing this skill.\n",
-        creation.name,
-        yaml_scalar(&creation.description),
-        title,
-        creation.name
-    );
-    let skill_file = skill_dir.join(SKILL_FILE);
-    fs::write(&skill_file, content).map_err(|source| SkillStoreError::Io {
-        path: skill_file,
-        source,
-    })?;
-    validate_skill_dir(&skill_dir)
+    format!(
+        "# {title}\n\n## Workflow\n\nDescribe the repeatable workflow this skill standardizes. Keep the core instructions here and move detailed references, deterministic scripts, or reusable assets into bundled resource directories.\n\n## Validation\n\nRun `agentos skill validate {name}` after editing this skill."
+    )
 }
 
 pub fn validate_skill_dir(path: &Path) -> Result<WorkspaceSkill, SkillStoreError> {
