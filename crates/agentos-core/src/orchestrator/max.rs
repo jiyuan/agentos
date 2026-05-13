@@ -157,13 +157,27 @@ impl MaxOrchestrator {
             // when it needs the filesystem / http / memory tools. The plain
             // `llm.complete(ctx)` default sends no `tools` field, so models
             // reply with "I can't modify files" even when tools are registered.
-            let messages = ctx
-                .state
-                .transcript
-                .items
-                .iter()
-                .map(|item| item.message.clone())
-                .collect::<Vec<_>>();
+            //
+            // Prepend the enabled skills' SKILL.md bodies as a system message
+            // so the LLM has the "how to use this skill" guidance — not just
+            // the one-line description that lives in the resource index.
+            // Without this, a sub-agent with `skills = ["skill-creator"]`
+            // sees `skill_create` in its tools list but never reads the
+            // SKILL.md that says "use `body` and `files` for one-shot bundle
+            // creation", so it falls back to calling the tool with name +
+            // description only and produces empty skeletons.
+            let mut messages: Vec<Message> =
+                Vec::with_capacity(ctx.state.transcript.items.len() + 1);
+            if let Some(prelude) = self.skill_prelude_message() {
+                messages.push(prelude);
+            }
+            messages.extend(
+                ctx.state
+                    .transcript
+                    .items
+                    .iter()
+                    .map(|item| item.message.clone()),
+            );
             let response = llm
                 .complete_messages(&messages, &self.available_tools)
                 .await
@@ -174,6 +188,30 @@ impl MaxOrchestrator {
             return Ok(Plan::Reply(response));
         }
         self.plan_internal(ctx, true).await
+    }
+
+    fn skill_prelude_message(&self) -> Option<Message> {
+        let skills = self.skill_catalog.skills().collect::<Vec<_>>();
+        if skills.is_empty() {
+            return None;
+        }
+        let mut body = String::from(
+            "# Available workspace skills\n\n\
+             The following workspace skills are enabled for this run. Read \
+             each skill's instructions before deciding whether to invoke its \
+             tools — the SKILL.md body is the contract the skill expects you \
+             to follow.\n",
+        );
+        for skill in skills {
+            body.push_str("\n---\n## skill: ");
+            body.push_str(&skill.name);
+            body.push_str("\n\n");
+            body.push_str(skill.instructions.as_ref());
+            if !skill.instructions.ends_with('\n') {
+                body.push('\n');
+            }
+        }
+        Some(Message::text(MessageRole::System, body))
     }
 
     async fn route_user_text_with_llm(
@@ -367,4 +405,44 @@ fn resource_index_from_tools(tools: &[ToolSpec]) -> ResourceIndex {
             .collect(),
     }
     .sorted()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skills::WorkspaceSkillCatalog;
+    use agentos_proto::MessageRole;
+    use std::path::PathBuf;
+
+    #[test]
+    fn skill_prelude_message_emits_each_skill_instructions() {
+        let catalog = WorkspaceSkillCatalog::from_skills([
+            crate::skills::WorkspaceSkill {
+                name: Arc::from("skill-creator"),
+                description: Arc::from("creates skills"),
+                path: PathBuf::from("/tmp/skill-creator"),
+                instructions: Arc::from("# Skill Creator\n\nAlways pass body and files together."),
+            },
+            crate::skills::WorkspaceSkill {
+                name: Arc::from("web-research"),
+                description: Arc::from("does research"),
+                path: PathBuf::from("/tmp/web-research"),
+                instructions: Arc::from("# Web Research\n\nUse http tool to fetch."),
+            },
+        ]);
+        let orch = MaxOrchestrator::default().with_skill_catalog(catalog);
+        let prelude = orch.skill_prelude_message().expect("prelude expected");
+        assert_eq!(prelude.role, MessageRole::System);
+        let body = prelude.content.as_ref();
+        assert!(body.contains("## skill: skill-creator"));
+        assert!(body.contains("Always pass body and files together."));
+        assert!(body.contains("## skill: web-research"));
+        assert!(body.contains("Use http tool to fetch."));
+    }
+
+    #[test]
+    fn skill_prelude_message_is_none_when_catalog_empty() {
+        let orch = MaxOrchestrator::default();
+        assert!(orch.skill_prelude_message().is_none());
+    }
 }

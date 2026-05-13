@@ -59,6 +59,7 @@ Schema:
 - `resources` *(optional)* — array of `"scripts"`, `"references"`, `"assets"`. Creates the empty directories so the bundle layout is in place.
 - `body` *(optional)* — the Markdown body of `SKILL.md`. The tool rebuilds the YAML frontmatter from `name`+`description`, so do not include the `---` fences in `body`. When `body` is omitted you get a placeholder scaffold.
 - `files` *(optional)* — array of `{ "path": "<relative>", "content": "<string>" }`. Writes every entry inside the skill directory in the same call. Paths cannot be absolute, cannot contain `..`, and cannot be the literal `SKILL.md` (use `body` for that).
+- `replace` *(optional, default `false`)* — when `true`, recursively removes the existing skill directory before creating the new bundle. Use this exactly when recovering from a partial prior call (the tool's "already exists" error explicitly points here). Do not set this on first attempts.
 
 The tool:
 

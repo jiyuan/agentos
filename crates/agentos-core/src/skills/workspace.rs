@@ -39,6 +39,11 @@ pub struct SkillCreation {
     /// same call. Paths must be relative, must not contain `..`, and
     /// must canonicalise within the skill directory.
     pub files: Vec<SkillBundleFile>,
+    /// When `true` and the skill directory already exists, remove it
+    /// (recursively) before writing the new bundle. Recovery path for
+    /// the case where a prior `create_skill` call produced an
+    /// incomplete skeleton.
+    pub replace: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,7 +70,12 @@ pub enum SkillStoreError {
     Invalid { path: PathBuf, message: String },
     #[error("configured skill '{0}' was not found in workspace skills")]
     Missing(Arc<str>),
-    #[error("skill '{0}' already exists")]
+    #[error(
+        "skill '{0}' already exists; pass `replace: true` to overwrite the \
+         existing bundle, or choose a different name. The previous call \
+         produced this directory — do not retry with the same args without \
+         setting `replace`."
+    )]
     Exists(Arc<str>),
 }
 
@@ -110,6 +120,18 @@ impl WorkspaceSkillCatalog {
         self.skills.values()
     }
 
+    /// Construct a catalog from an explicit set of skills. Test-only —
+    /// production code goes through [`Self::load_enabled`] so disk is the
+    /// source of truth.
+    #[cfg(test)]
+    pub fn from_skills(skills: impl IntoIterator<Item = WorkspaceSkill>) -> Self {
+        let mut map = BTreeMap::new();
+        for skill in skills {
+            map.insert(Arc::clone(&skill.name), skill);
+        }
+        Self { skills: map }
+    }
+
     /// Return a sub-catalog containing only the named skills (in any order).
     /// Names are normalised to lowercase hyphen-case before lookup. Unknown
     /// names are silently skipped — callers that care about presence should
@@ -140,6 +162,7 @@ impl SkillCreation {
             resources: BTreeSet::new(),
             body: None,
             files: Vec::new(),
+            replace: false,
         }
     }
 
@@ -170,7 +193,14 @@ pub fn create_skill(
     })?;
     let skill_dir = root.join(creation.name.as_ref());
     if skill_dir.exists() {
-        return Err(SkillStoreError::Exists(Arc::clone(&creation.name)));
+        if creation.replace {
+            fs::remove_dir_all(&skill_dir).map_err(|source| SkillStoreError::Io {
+                path: skill_dir.clone(),
+                source,
+            })?;
+        } else {
+            return Err(SkillStoreError::Exists(Arc::clone(&creation.name)));
+        }
     }
     fs::create_dir(&skill_dir).map_err(|source| SkillStoreError::Io {
         path: skill_dir.clone(),

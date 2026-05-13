@@ -41,6 +41,13 @@ struct SkillCreateArgs {
     /// in the same call.
     #[serde(default)]
     files: Vec<SkillCreateFileArgs>,
+    /// When `true` and the skill already exists, replace the existing
+    /// bundle. Without this, a retry after a failed/incomplete first
+    /// call returns an `already exists` error. Set this when recovering
+    /// from a partial scaffold or when the user explicitly asks to
+    /// overwrite.
+    #[serde(default)]
+    replace: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,15 +63,21 @@ impl Tool for SkillCreatorTool {
         ToolSpec {
             name: Arc::from("skill_create"),
             description: Arc::from(
-                "Create a complete workspace skill in one call. Writes \
-                 workspace/skills/<name>/SKILL.md (with YAML frontmatter \
-                 rebuilt from `name` + `description`), creates the requested \
-                 resource subdirectories (scripts, references, assets), and \
-                 writes any extra bundle files passed in `files`. Prefer one \
-                 atomic call with `body` and `files` over scaffolding and then \
-                 editing — the tool validates the SKILL.md shape before \
-                 returning, so a successful result means the full bundle is \
-                 on disk.",
+                "Create a complete workspace skill bundle in one call. \
+                 Required behavior: when the user asks for a real (non-trivial) \
+                 skill, always provide `body` with the full SKILL.md Markdown \
+                 instructions AND `files` with every script/reference/asset \
+                 the skill needs to function. Do NOT call this tool with only \
+                 `name` and `description` unless the user explicitly asked \
+                 for an empty scaffold — that produces a useless directory \
+                 the user will have to fill in by hand. \
+                 The tool writes workspace/skills/<name>/SKILL.md (rebuilding \
+                 the YAML frontmatter from `name` + `description`), creates \
+                 the requested resource subdirectories, writes every `files[]` \
+                 entry under the skill directory, and validates the result \
+                 before returning. If a previous call left an incomplete \
+                 skeleton, set `replace: true` to overwrite it rather than \
+                 retrying with the same args.",
             ),
             input_schema: json!({
                 "type": "object",
@@ -98,6 +111,10 @@ impl Tool for SkillCreatorTool {
                                 "content": { "type": "string" }
                             }
                         }
+                    },
+                    "replace": {
+                        "type": "boolean",
+                        "description": "When true and the skill already exists, replace the existing bundle. Use this to recover from a partial earlier call (e.g. a previous skill_create produced an empty skeleton)."
                     }
                 }
             }),
@@ -141,6 +158,7 @@ impl Tool for SkillCreatorTool {
             resources,
             body: parsed.body.as_deref().map(Arc::from),
             files,
+            replace: parsed.replace,
         };
         let root = skills_root_for_tests().unwrap_or_else(default_skills_dir);
         let skill = create_skill(&root, &creation)
@@ -326,6 +344,66 @@ mod tests {
             "expected absolute-path rejection, got: {msg}"
         );
         assert!(!std::path::Path::new("/tmp/agentos-pwn.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn skill_creator_tool_replaces_existing_bundle_when_replace_set() {
+        // Recovery path for the user's reported flow: first call left a
+        // skeleton, second call with replace=true overwrites it with the
+        // full bundle.
+        let guard = SkillsDirGuard::new("skill-creator-replace");
+
+        // Initial empty scaffold.
+        let scaffold_args = json!({
+            "name": "redo-skill",
+            "description": "Initial empty scaffold from a botched first try.",
+        });
+        let raw = RawValue::from_string(scaffold_args.to_string()).unwrap();
+        SkillCreatorTool
+            .call(&tool_call("skill_create", "first"), &raw)
+            .await
+            .unwrap();
+
+        // Retry without replace must fail with the recovery hint.
+        let retry_args = json!({
+            "name": "redo-skill",
+            "description": "Retry attempt that should be rejected.",
+        });
+        let raw = RawValue::from_string(retry_args.to_string()).unwrap();
+        let err = SkillCreatorTool
+            .call(&tool_call("skill_create", "retry"), &raw)
+            .await
+            .unwrap_err();
+        let ToolError::Failed(msg) = err;
+        assert!(
+            msg.contains("already exists") && msg.contains("replace"),
+            "expected `already exists` + recovery hint, got: {msg}"
+        );
+
+        // Retry with replace=true succeeds and overwrites.
+        let replace_args = json!({
+            "name": "redo-skill",
+            "description": "Full bundle on the recovery pass.",
+            "body": "# Redo Skill\n\nThis is the recovery body.\n",
+            "files": [
+                { "path": "scripts/run.py", "content": "print('recovered')\n" }
+            ],
+            "replace": true,
+        });
+        let raw = RawValue::from_string(replace_args.to_string()).unwrap();
+        let result = SkillCreatorTool
+            .call(&tool_call("skill_create", "replace"), &raw)
+            .await
+            .unwrap();
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        let skill_md =
+            std::fs::read_to_string(guard.dir.join("redo-skill").join("SKILL.md")).unwrap();
+        assert!(skill_md.contains("recovery body"));
+        assert!(!skill_md.contains("Initial empty scaffold"));
+        let run_py =
+            std::fs::read_to_string(guard.dir.join("redo-skill").join("scripts").join("run.py"))
+                .unwrap();
+        assert_eq!(run_py, "print('recovered')\n");
     }
 
     #[tokio::test]
