@@ -32,7 +32,10 @@ pub(super) struct WebSocketConnection {
 impl WebSocketConnection {
     pub(super) async fn connect(url: &str) -> Result<Self, ChannelError> {
         let target = TargetUrl::parse(url)?;
-        let proxy = https_proxy_for_target(&target.host);
+        let proxy = target
+            .tls
+            .then(|| https_proxy_for_target(&target.host))
+            .flatten();
 
         let stream = match proxy {
             Some(proxy) => connect_via_proxy(&proxy, &target).await?,
@@ -169,14 +172,21 @@ async fn connect_via_proxy(proxy: &Proxy, target: &TargetUrl) -> Result<WsStream
 struct TargetUrl {
     host: String,
     port: u16,
+    tls: bool,
     original_url: String,
 }
 
 impl TargetUrl {
     fn parse(url: &str) -> Result<Self, ChannelError> {
-        let rest = url.strip_prefix("wss://").ok_or_else(|| {
-            ChannelError::Backend(Arc::from("Feishu WebSocket URL must use wss://"))
-        })?;
+        let (rest, tls, default_port) = if let Some(rest) = url.strip_prefix("wss://") {
+            (rest, true, 443)
+        } else if let Some(rest) = url.strip_prefix("ws://") {
+            (rest, false, 80)
+        } else {
+            return Err(ChannelError::Backend(Arc::from(
+                "Feishu WebSocket URL must use ws:// or wss://",
+            )));
+        };
         let (authority, _path) = rest.split_once('/').unwrap_or((rest, ""));
         if authority.is_empty() {
             return Err(ChannelError::Backend(Arc::from(
@@ -190,11 +200,12 @@ impl TargetUrl {
                 })?;
                 (host.to_owned(), parsed)
             }
-            None => (authority.to_owned(), 443),
+            None => (authority.to_owned(), default_port),
         };
         Ok(Self {
             host,
             port,
+            tls,
             original_url: url.to_owned(),
         })
     }
@@ -356,8 +367,16 @@ mod tests {
     }
 
     #[test]
-    fn target_url_rejects_non_wss() {
-        assert!(TargetUrl::parse("ws://example.com").is_err());
+    fn target_url_accepts_plain_ws_for_local_mocks() {
+        let parsed = TargetUrl::parse("ws://example.com/events").unwrap();
+        assert_eq!(parsed.host, "example.com");
+        assert_eq!(parsed.port, 80);
+        assert!(!parsed.tls);
+    }
+
+    #[test]
+    fn target_url_rejects_non_websocket_scheme() {
+        assert!(TargetUrl::parse("http://example.com").is_err());
     }
 
     #[test]

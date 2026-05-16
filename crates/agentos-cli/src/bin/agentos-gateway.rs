@@ -1,13 +1,13 @@
 use agentos_cli::slash::{self, Parsed, SlashCommand, SlashContext};
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
+use agentos_core::config::WorkspaceConfig;
 use agentos_core::crons::CronStore;
-use agentos_core::gateway::{GatewayRun, GatewayService};
+use agentos_core::gateway::{apply_reply_prefix, extract_reply_prefix, GatewayRun, GatewayService};
 use agentos_core::runner::ResumeDecision;
-use agentos_core::runtime::{AgentRuntime, RuntimePaths};
+use agentos_core::runtime::{load_workspace_config, AgentRuntime, RuntimePaths};
 use agentos_interfaces::Channel;
 use agentos_llm::env as agentos_env;
 use agentos_proto::{Envelope, Message, MessageRole, RunId, SpanKind};
-use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -79,6 +79,7 @@ fn run() -> Result<(), String> {
             start(config)
         }
         "status" => status(&config),
+        "config" => print_effective_config(&config),
         "serve" => serve(&config),
         "-h" | "--help" | "help" => {
             usage();
@@ -91,7 +92,7 @@ fn run() -> Result<(), String> {
 fn usage() {
     eprintln!(
         "\
-Usage: agentos-gateway <start|stop|restart|status> [OPTIONS]
+Usage: agentos-gateway <start|stop|restart|status|config> [OPTIONS]
 
 Manage the AgentOS gateway as a persistent background service.
 
@@ -100,6 +101,7 @@ Subcommands:
   stop       Stop the running gateway service.
   restart    Stop then start the gateway service.
   status     Report whether the gateway service is running.
+  config     Print the effective workspace config used by the gateway.
 
 Options:
   --pid-path PATH             PID file. Default: {DEFAULT_PID_PATH}
@@ -356,6 +358,80 @@ fn status(config: &ServiceConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn print_effective_config(config: &ServiceConfig) -> Result<(), String> {
+    let path = agent_config_path(config);
+    let runtime_paths = runtime_paths(config);
+    let workspace_config = load_workspace_config(&path)
+        .map_err(|err| format!("failed to load workspace config: {err}"))?;
+    let channels = persistent_channels(&workspace_config)?;
+    println!("config.path={}", path.display());
+    println!(
+        "paths.workspace_root={}",
+        runtime_paths.workspace_root.display()
+    );
+    println!("paths.skills_dir={}", runtime_paths.skills_dir.display());
+    println!("paths.cron_dir={}", runtime_paths.cron_dir.display());
+    println!(
+        "paths.attachments_dir={}",
+        attachments_dir_path(&workspace_dir(&path)).display()
+    );
+    println!("agent.id={}", workspace_config.agent.id);
+    println!("agent.orchestrator={}", workspace_config.agent.orchestrator);
+    println!("agent.max_turns={}", workspace_config.agent.max_turns);
+    println!("policy.default={}", workspace_config.policy.default);
+    println!(
+        "channels.tui={} ({})",
+        workspace_config.channels.tui.enabled, workspace_config.channels.tui.mode
+    );
+    println!(
+        "channels.telegram={} ({})",
+        workspace_config.channels.telegram.enabled, workspace_config.channels.telegram.mode
+    );
+    println!(
+        "channels.feishu={} ({})",
+        workspace_config.channels.feishu.enabled, workspace_config.channels.feishu.mode
+    );
+    println!("channels.persistent={}", channels.join(","));
+    println!(
+        "resources.priority={}",
+        join_arcs(&workspace_config.resources.priority)
+    );
+    println!(
+        "resources.skills.enabled={}",
+        join_arcs(&workspace_config.resources.skills.enabled)
+    );
+    println!(
+        "resources.tools.enabled={}",
+        join_arcs(&workspace_config.resources.tools.enabled)
+    );
+    println!(
+        "resources.mcp.enabled={}",
+        join_arcs(&workspace_config.resources.mcp.enabled)
+    );
+    println!(
+        "resources.llm.enabled={}",
+        join_arcs(&workspace_config.resources.llm.enabled)
+    );
+    println!("subagents.count={}", workspace_config.subagents.len());
+    println!(
+        "orchestrator_templates.count={}",
+        workspace_config.orchestrator_templates.len()
+    );
+    println!(
+        "task_workspace.root={}",
+        workspace_config.task_workspace.root.display()
+    );
+    Ok(())
+}
+
+fn join_arcs(values: &[Arc<str>]) -> String {
+    values
+        .iter()
+        .map(|value| value.as_ref())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn serve(config: &ServiceConfig) -> Result<(), String> {
     ensure_parent_dir(&config.pid_path)?;
     ensure_parent_dir(&config.log_path)?;
@@ -370,7 +446,9 @@ fn serve(config: &ServiceConfig) -> Result<(), String> {
         ),
     )?;
 
-    let channels = persistent_channels()?;
+    let workspace_config = load_workspace_config(&agent_config_path(config))
+        .map_err(|err| format!("failed to load workspace config: {err}"))?;
+    let channels = persistent_channels(&workspace_config)?;
     if !channels.is_empty() {
         for channel in &channels {
             log_line(config, &format!("{channel} channel enabled"))?;
@@ -380,7 +458,7 @@ fn serve(config: &ServiceConfig) -> Result<(), String> {
 
     log_line(
         config,
-        "no persistent channels enabled; set AGENTOS_ENABLED_CHANNELS=telegram,feishu",
+        "no persistent channels enabled; enable [channels.telegram]/[channels.feishu] or set AGENTOS_ENABLED_CHANNELS=telegram,feishu",
     )?;
     loop {
         thread::sleep(Duration::from_secs(60));
@@ -457,15 +535,19 @@ fn run_persistent_channel(config: &ServiceConfig, channel: &'static str) -> Resu
 }
 
 async fn run_telegram_gateway(config: &ServiceConfig) -> Result<(), String> {
+    let attachments_dir = attachments_dir_path(&workspace_dir(&agent_config_path(config)));
     let channel = TelegramChannel::from_env()
         .map_err(|err| format!("failed to configure telegram channel: {err}"))?
+        .with_attachments_root(attachments_dir)
         .with_receive_error_logging(true);
     run_channel_gateway(config, channel, "telegram", RunId::new("telegram-gateway")).await
 }
 
 async fn run_feishu_gateway(config: &ServiceConfig) -> Result<(), String> {
+    let attachments_dir = attachments_dir_path(&workspace_dir(&agent_config_path(config)));
     let channel = FeishuChannel::from_env()
         .map_err(|err| format!("failed to configure feishu channel: {err}"))?
+        .with_attachments_root(attachments_dir)
         .with_receive_error_logging(true);
     run_channel_gateway(config, channel, "feishu", RunId::new("feishu-gateway")).await
 }
@@ -479,12 +561,7 @@ async fn run_channel_gateway<C>(
 where
     C: Channel,
 {
-    let runtime = AgentRuntime::build(RuntimePaths {
-        agent_config_path: agent_config_path(config),
-        session_db_path: session_path(config),
-        trace_dir: trace_dir_path(),
-    })
-    .await?;
+    let runtime = AgentRuntime::build(runtime_paths(config)).await?;
     log_line(config, &runtime.orchestrator.describe_llm())?;
     let deps_scope = runtime.deps_scope();
     let input_guardrails = deps_scope.input_guardrails();
@@ -493,7 +570,7 @@ where
     let deps =
         deps_scope.deps_with_guardrails(&input_guardrails, &output_guardrails, &tool_guardrails);
     let gateway_service = GatewayService::new(&deps, Arc::from(runtime.active_agent.as_str()));
-    let cron_store = CronStore::new(slash::cron_dir_path());
+    let cron_store = CronStore::new(cron_dir_path(&workspace_dir(&agent_config_path(config))));
     let orchestrator_handle = runtime.orchestrator.strategy_handle();
     let model_controller = runtime.model_controller.clone();
     log_line(config, &format!("{channel_name} gateway loop started"))?;
@@ -512,6 +589,7 @@ where
             thread::sleep(Duration::from_secs(1));
             continue;
         };
+        extract_reply_prefix(&mut input);
         match slash::parse(&input.message.content) {
             Parsed::Cmd(SlashCommand::Clear) => {
                 let removed = runtime
@@ -603,7 +681,7 @@ where
             Ok(GatewayRun::Finished { state, .. }) => {
                 log_trace(config, &state)?;
             }
-            Ok(GatewayRun::Paused { paused, .. }) => {
+            Ok(GatewayRun::Paused { mut paused, .. }) => loop {
                 let Some(approval_id) = paused
                     .state
                     .pending_approvals
@@ -614,14 +692,14 @@ where
                         config,
                         &format!("{channel_name} run paused without pending approval"),
                     )?;
-                    continue;
+                    break;
                 };
                 let Some(answer) = channel.receive().await else {
                     log_line(
                         config,
                         &format!("{channel_name} approval prompt sent; no approval received"),
                     )?;
-                    continue;
+                    break;
                 };
                 let decision = if answer.message.content.trim().eq_ignore_ascii_case("y") {
                     ResumeDecision::Approve
@@ -634,18 +712,28 @@ where
                     .resume(&channel, paused, &approval_id, decision)
                     .await
                 {
-                    Ok(GatewayRun::Finished { state, .. }) => log_trace(config, &state)?,
-                    Ok(GatewayRun::Paused { .. }) => {
+                    Ok(GatewayRun::Finished { state, .. }) => {
+                        log_trace(config, &state)?;
+                        break;
+                    }
+                    Ok(GatewayRun::Paused {
+                        paused: next_paused,
+                        ..
+                    }) => {
                         log_line(
                             config,
-                            &format!("{channel_name} run paused again after resume"),
+                            &format!(
+                                "{channel_name} run paused again after resume; awaiting next approval"
+                            ),
                         )?;
+                        paused = next_paused;
                     }
                     Err(err) => {
                         log_line(config, &format!("{channel_name} resume failed: {err}"))?;
+                        break;
                     }
                 }
-            }
+            },
             Err(err) => {
                 log_line(config, &format!("{channel_name} gateway run failed: {err}"))?;
                 if let Err(send_err) = channel
@@ -667,8 +755,16 @@ where
     }
 }
 
-fn persistent_channels() -> Result<Vec<&'static str>, String> {
-    if let Ok(channels) = env::var("AGENTOS_ENABLED_CHANNELS") {
+fn persistent_channels(config: &WorkspaceConfig) -> Result<Vec<&'static str>, String> {
+    let override_channels = env::var("AGENTOS_ENABLED_CHANNELS").ok();
+    persistent_channels_from_override(config, override_channels.as_deref())
+}
+
+fn persistent_channels_from_override(
+    config: &WorkspaceConfig,
+    override_channels: Option<&str>,
+) -> Result<Vec<&'static str>, String> {
+    if let Some(channels) = override_channels {
         let mut enabled = Vec::new();
         for channel in channels.split(',').map(str::trim) {
             match channel {
@@ -681,13 +777,11 @@ fn persistent_channels() -> Result<Vec<&'static str>, String> {
         return Ok(enabled);
     }
 
-    let telegram_configured = env::var_os("AGENTOS_TELEGRAM_BOT_TOKEN").is_some();
-    let feishu_configured = env::var_os("AGENTOS_FEISHU_APP_ID").is_some();
     let mut enabled = Vec::new();
-    if telegram_configured {
+    if config.channels.telegram.enabled {
         enabled.push("telegram");
     }
-    if feishu_configured {
+    if config.channels.feishu.enabled {
         enabled.push("feishu");
     }
     Ok(enabled)
@@ -696,6 +790,37 @@ fn persistent_channels() -> Result<Vec<&'static str>, String> {
 fn push_unique_channel(channels: &mut Vec<&'static str>, channel: &'static str) {
     if !channels.contains(&channel) {
         channels.push(channel);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_channels_default_to_config() {
+        let mut config = WorkspaceConfig::default();
+        config.channels.telegram.enabled = true;
+        config.channels.feishu.enabled = false;
+
+        assert_eq!(
+            persistent_channels_from_override(&config, None).expect("channels resolve"),
+            vec!["telegram"]
+        );
+    }
+
+    #[test]
+    fn persistent_channels_env_override_takes_precedence() {
+        let mut config = WorkspaceConfig::default();
+        config.channels.telegram.enabled = false;
+        config.channels.feishu.enabled = false;
+
+        assert_eq!(
+            persistent_channels_from_override(&config, Some("feishu,telegram,telegram"))
+                .expect("channels resolve"),
+            vec!["feishu", "telegram"]
+        );
+        assert!(persistent_channels_from_override(&config, Some("slack")).is_err());
     }
 }
 
@@ -715,18 +840,62 @@ fn agent_config_path(config: &ServiceConfig) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("workspace/agent.toml"))
 }
 
-fn session_path(config: &ServiceConfig) -> PathBuf {
+fn runtime_paths(config: &ServiceConfig) -> RuntimePaths {
+    let agent_config_path = agent_config_path(config);
+    let workspace_dir = workspace_dir(&agent_config_path);
+    RuntimePaths {
+        agent_config_path,
+        session_db_path: session_path(config, &workspace_dir),
+        trace_dir: trace_dir_path(&workspace_dir),
+        workspace_root: workspace_root_path(),
+        skills_dir: skills_dir_path(&workspace_dir),
+        cron_dir: cron_dir_path(&workspace_dir),
+    }
+}
+
+fn workspace_dir(agent_config_path: &Path) -> PathBuf {
+    agent_config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
+}
+
+fn workspace_root_path() -> PathBuf {
+    env::var_os("AGENTOS_WORKSPACE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn session_path(config: &ServiceConfig, workspace_dir: &Path) -> PathBuf {
     config
         .session_db_path
         .clone()
         .or_else(|| env::var_os("AGENTOS_SESSION_DB_PATH").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("workspace/agentos.sqlite"))
+        .unwrap_or_else(|| workspace_dir.join("agentos.sqlite"))
 }
 
-fn trace_dir_path() -> PathBuf {
+fn trace_dir_path(workspace_dir: &Path) -> PathBuf {
     env::var_os("AGENTOS_TRACE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("workspace/traces"))
+        .unwrap_or_else(|| workspace_dir.join("traces"))
+}
+
+fn skills_dir_path(workspace_dir: &Path) -> PathBuf {
+    env::var_os("AGENTOS_SKILLS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_dir.join("skills"))
+}
+
+fn cron_dir_path(workspace_dir: &Path) -> PathBuf {
+    env::var_os("AGENTOS_CRON_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_dir.join("crons"))
+}
+
+fn attachments_dir_path(workspace_dir: &Path) -> PathBuf {
+    env::var_os("AGENTOS_ATTACHMENTS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_dir.join("attachments"))
 }
 
 fn log_trace(config: &ServiceConfig, state: &agentos_interfaces::RunState) -> Result<(), String> {
@@ -762,13 +931,15 @@ fn failure_envelope(input: &Envelope, sender: &str, error: &str) -> Envelope {
 }
 
 fn command_reply_envelope(input: &Envelope, sender: &str, content: &str) -> Envelope {
-    Envelope {
+    let mut output = Envelope {
         channel_id: input.channel_id.clone(),
         conversation_id: input.conversation_id.clone(),
         sender: Arc::from(sender),
         message: Message::text(MessageRole::Assistant, content),
-        metadata: BTreeMap::new(),
-    }
+        metadata: input.metadata.clone(),
+    };
+    apply_reply_prefix(&mut output);
+    output
 }
 
 fn user_facing_error_message(error: &str) -> String {

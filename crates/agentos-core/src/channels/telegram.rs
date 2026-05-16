@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -19,13 +19,20 @@ pub struct TelegramChannel {
     offset: Option<i64>,
     log_receive_errors: bool,
     attachments: AttachmentStore,
+    api_base: Arc<str>,
+    file_base: Arc<str>,
 }
+
+const TELEGRAM_DEFAULT_API_BASE: &str = "https://api.telegram.org";
 
 impl TelegramChannel {
     pub fn from_env() -> Result<Self, ChannelError> {
         let token = env::var("AGENTOS_TELEGRAM_BOT_TOKEN")
             .map_err(|_| ChannelError::Backend(Arc::from("missing AGENTOS_TELEGRAM_BOT_TOKEN")))?;
         let allowed_chat_id = env::var("AGENTOS_TELEGRAM_CHAT_ID").ok().map(Arc::from);
+        let api_base = env::var("AGENTOS_TELEGRAM_API_BASE")
+            .unwrap_or_else(|_| TELEGRAM_DEFAULT_API_BASE.to_owned());
+        let file_base = env::var("AGENTOS_TELEGRAM_FILE_BASE").unwrap_or_else(|_| api_base.clone());
         Ok(Self {
             token: Arc::from(token),
             id: ChannelId::new("telegram"),
@@ -33,6 +40,8 @@ impl TelegramChannel {
             offset: None,
             log_receive_errors: false,
             attachments: AttachmentStore::from_env("telegram"),
+            api_base: Arc::from(api_base.trim_end_matches('/').to_owned()),
+            file_base: Arc::from(file_base.trim_end_matches('/').to_owned()),
         })
     }
 
@@ -41,15 +50,17 @@ impl TelegramChannel {
         self
     }
 
+    pub fn with_attachments_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.attachments = AttachmentStore::new(root, "telegram");
+        self
+    }
+
     fn api_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{method}", self.token)
+        format!("{}/bot{}/{method}", self.api_base, self.token)
     }
 
     fn file_url(&self, file_path: &str) -> String {
-        format!(
-            "https://api.telegram.org/file/bot{}/{file_path}",
-            self.token
-        )
+        format!("{}/file/bot{}/{file_path}", self.file_base, self.token)
     }
 
     fn fetch_updates(&self) -> Result<Value, ChannelError> {

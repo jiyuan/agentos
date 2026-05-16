@@ -152,6 +152,12 @@ fn strip_prefix_ascii<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
     if input.len() < prefix.len() {
         return None;
     }
+    // `prefix.len()` is a byte count. If it lands inside a multibyte UTF-8
+    // character, `input` cannot start with this ASCII prefix anyway, and
+    // slicing there would panic. Bail out safely.
+    if !input.is_char_boundary(prefix.len()) {
+        return None;
+    }
     let (head, tail) = input.split_at(prefix.len());
     if head.eq_ignore_ascii_case(prefix) {
         Some(tail)
@@ -232,7 +238,7 @@ pub fn format_skills(catalog: &WorkspaceSkillCatalog) -> String {
     if catalog.is_empty() {
         return [
             "No legacy skills are enabled in this workspace.",
-            "Define skills under workspace/skills/<name>/SKILL.md and enable them via",
+            "Define skills under the configured skills directory and enable them via",
             "`[resources.skills] enabled = [\"<name>\"]` in workspace/agent.toml.",
         ]
         .join("\n");
@@ -371,6 +377,7 @@ pub async fn format_memory(
         conversation_id: conversation_id.clone(),
         user_id: None,
         allowed_shared_domains: Vec::new(),
+        audit_read_access: false,
     };
     let request = HydrationRequest {
         query: Arc::from(""),
@@ -476,7 +483,11 @@ pub fn format_model_reset(controller: Option<&LlmModelController>) -> String {
 pub fn cron_dir_path() -> PathBuf {
     env::var_os("AGENTOS_CRON_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("workspace/crons"))
+        .unwrap_or_else(|| {
+            env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("crons")
+        })
 }
 
 fn fragment_summary(body: &serde_json::Value, max: usize) -> String {
@@ -561,6 +572,18 @@ mod tests {
         assert_eq!(parse("/crons"), Parsed::Cmd(SlashCommand::ListCrons));
         assert_eq!(parse("/tools"), Parsed::Cmd(SlashCommand::ListTools));
         assert_eq!(parse("/memory"), Parsed::Cmd(SlashCommand::ListMemory));
+    }
+
+    #[test]
+    fn parse_handles_multibyte_utf8_without_panicking() {
+        // Regression: strip_prefix_ascii used a byte-index split_at that
+        // panicked when a non-slash multibyte message (e.g. Chinese) had a
+        // non-char-boundary at the candidate prefix length.
+        assert_eq!(parse("用中文回复一句关于人工智能的话。"), Parsed::NotSlash);
+        assert_eq!(parse("🟢 🟡 🔴 ⚪ 🟣"), Parsed::NotSlash);
+        assert_eq!(parse("привет мир"), Parsed::NotSlash);
+        // Slash command followed by multibyte argument must not panic.
+        assert!(matches!(parse("/skills 用中文"), Parsed::Usage(_)));
     }
 
     #[test]
