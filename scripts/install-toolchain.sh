@@ -48,6 +48,17 @@ ERROR
   exit 1
 fi
 
+if ! rustup show >/dev/null 2>&1; then
+  cat >&2 <<ERROR
+A rustup proxy is on PATH but rustup is not initialized for this user
+(\$HOME=$HOME). Initialize it, then rerun this script:
+
+  rustup-init -y            # or: install from https://rustup.rs
+  rustup default ${rust_toolchain}
+ERROR
+  exit 1
+fi
+
 echo "Installing Rust toolchain: ${rust_toolchain}"
 rustup toolchain install "$rust_toolchain"
 rustup component add clippy rustfmt --toolchain "$rust_toolchain"

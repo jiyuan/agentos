@@ -74,6 +74,22 @@ build_from_source() {
     echo "rustup is required for --from-source installs" >&2
     exit 1
   fi
+  if ! rustup show >/dev/null 2>&1; then
+    cat >&2 <<ERROR
+A rustup proxy is on PATH but rustup is not initialized for this user
+(\$HOME=$HOME). This commonly happens when running as root with a
+distribution rustup package that was never set up.
+
+Initialize it for the current user, then rerun this script:
+
+  rustup-init -y            # or: install from https://rustup.rs
+  rustup default ${rust_toolchain}
+
+If a working toolchain lives under another user's home, re-run with
+RUSTUP_HOME and CARGO_HOME pointing at it.
+ERROR
+    exit 1
+  fi
   "$root/scripts/install-toolchain.sh"
   rustup run "$rust_toolchain" cargo build \
     --release \
