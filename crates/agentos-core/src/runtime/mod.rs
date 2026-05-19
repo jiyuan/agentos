@@ -603,7 +603,7 @@ pub async fn register_configured_mcp(
             spec: ToolSpec {
                 name: Arc::clone(&tool.name),
                 description: Arc::clone(&tool.description),
-                input_schema: serde_json::json!({ "type": "object" }),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
                 requires_isolation: tool.requires_isolation,
             },
             response: Arc::clone(&tool.response),

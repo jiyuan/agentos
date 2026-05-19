@@ -1,6 +1,6 @@
 ---
 name: audit-skill
-description: Reconstruct and summarize AgentOS activity from trace JSONL, session JSONL, and gateway logs. Use when the user asks for an audit, usage report, token consumption, model call count, task executions, task success rate, or operational health summary.
+description: Reconstruct and summarize AgentOS activity from trace JSONL, session JSONL, and gateway logs. Use when the user asks for an audit, usage report, token consumption, model call count, task executions, task success rate, operational health summary, review, or ranking.
 ---
 
 # Audit Skill
@@ -16,7 +16,18 @@ Trigger this skill when the user asks any of:
 - "model calls" or "how many LLM calls"
 - "task executions" or "task success rate"
 - "operational health" or "activity summary"
-- "how much did we use" or "last 24 hours activity"
+- "review" or "rank"
+
+## Mandatory Evaluation Dimensions
+
+Whenever the user asks for a **review** or **ranking**, you must evaluate all four dimensions below. Do not omit any dimension, and do not treat them as optional or implied:
+
+1. **Correctness**
+2. **Completeness**
+3. **Clarity**
+4. **Actionability**
+
+If the user does not specify a rubric, apply these four dimensions by default and present each one explicitly.
 
 ## Scope
 
@@ -46,7 +57,7 @@ Then for each recent file, read the tail:
 
 4. Trace JSONL: `file(operation="read", path="<trace-jsonl>", max_bytes=65536, tail=true)`
 5. Session JSONL: `file(operation="read", path="<session-jsonl>", max_bytes=65536, tail=true)`
-6. Gateway log: `file(operation="read", path="<log-file>", max_bytes=65536, tail=true)` or `shell(command="tail", args=["-n","500","<log-file>"])`
+6. Gateway log: `file(operation="read", path="<log-file>", max_bytes=65536, tail=true)` or `tail` command if available
 
 ## Temporal Filtering
 
@@ -58,7 +69,7 @@ If a known directory has no files modified within the window, skip that source a
 
 ## Incremental Retrieval
 
-For file tool reads, use `tail=true` with `max_bytes=65536`. For shell retrieval, use only the allowlisted `tail` command with `-n 500`.
+For file tool reads, use `tail=true` with `max_bytes=65536`.
 
 If a returned file result says it was truncated, compute the audit from the returned tail sample and mention that the report is based on bounded recent evidence. Do not continue paging through large files unless the user explicitly asks for a forensic full-history audit.
 
@@ -138,15 +149,6 @@ If no cron data is found in the gateway log or any other source, report `0` for 
 
 Gateway log lines like `trace: run=1, plan=10, llm=10` provide a quick summary of run/plan/LLM counts per batch. These are useful as a cross-check but less reliable than structured JSONL parsing. When the gateway log is available, extract these lines and compare against your JSONL counts.
 
-## Script Note
-
-The `workspace/skills/audit-skill/scripts/token_counter.py` script exists to parse `token_counts` or `usage` fields from trace and session JSONL files. Because:
-
-- `python3` is not in the shell allowlist (so the script cannot be executed)
-- No `token_counts`/`usage` fields exist in the current workspace data
-
-**Do not attempt to run `token_counter.py`.** Use the methods described above instead. The script is preserved for future use when token logging fields become available and `python3` is allowlisted.
-
 ## Workflow
 
 1. List traces directory (`workspace/traces`) with `modified_within_hours=24`.
@@ -154,7 +156,7 @@ The `workspace/skills/audit-skill/scripts/token_counter.py` script exists to par
 3. List logs directory with `modified_within_hours=24`.
 4. Read the tail of each recent trace JSONL file (`max_bytes=65536, tail=true`).
 5. Read the tail of each recent session JSONL file (`max_bytes=65536, tail=true`).
-6. Read the tail of each recent log file (file tool or `tail` command).
+6. Read the tail of each recent log file.
 7. Parse each line of the retrieved trace/session/log samples to extract metrics:
    - Count LLM spans for model calls.
    - Sum `llm_token_usage` events for exact token counts (including cache read/write).
@@ -166,7 +168,8 @@ The `workspace/skills/audit-skill/scripts/token_counter.py` script exists to par
    - Extract cron execution records if present.
    - Extract gateway log trace summary lines.
 8. Compute success rate.
-9. Write the report using the output format below.
+9. When the user asked for a review or ranking, include the four mandatory evaluation dimensions explicitly in the response.
+10. Write the report using the output format below.
 
 ## Output Format
 
