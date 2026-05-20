@@ -6,6 +6,7 @@ max_turns = 32
 
 [policy]
 default = "deny"
+allowlist = ["shell", "file", "cron_create", "cron_remove", "memory"]
 
 [memory]
 backend = "sqlite"

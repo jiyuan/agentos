@@ -28,8 +28,13 @@ pub(super) fn build_parent_tools(
 pub fn phase5_policy(config: &WorkspaceConfig, mcp_specs: &[ToolSpec]) -> Policy {
     let mut policy = Policy::default();
     policy.default_decision = policy_default_decision(&config.policy.default);
+    let allowlist = &config.policy.allowlist;
     for tool in &config.resources.tools.enabled {
-        add_builtin_tool_policy(&mut policy, tool);
+        if is_allowlisted(allowlist, tool) {
+            allowlist_tool(&mut policy, Arc::clone(tool));
+        } else {
+            add_builtin_tool_policy(&mut policy, tool);
+        }
     }
     if !config.subagents.is_empty() {
         policy.rules.push(PolicyRule {
@@ -51,6 +56,29 @@ pub fn phase5_policy(config: &WorkspaceConfig, mcp_specs: &[ToolSpec]) -> Policy
         allow_tool_once(&mut policy, Arc::clone(&spec.name));
     }
     policy
+}
+
+fn is_allowlisted(allowlist: &[Arc<str>], tool: &Arc<str>) -> bool {
+    allowlist.iter().any(|entry| entry == tool)
+}
+
+// Bypass any `AskUser` gating for a tool the operator has explicitly
+// allowlisted. Unlike `allow_tool_once`, this does not exempt `memory` —
+// the operator's intent in naming the tool is to suppress the prompts.
+fn allowlist_tool(policy: &mut Policy, tool: Arc<str>) {
+    if policy.rules.iter().any(|rule| {
+        rule.action == PolicyAction::Tool(Arc::clone(&tool))
+            && rule.decision == PolicyVerb::Allow
+            && rule.arg_equals.is_empty()
+    }) {
+        return;
+    }
+    policy.rules.push(PolicyRule {
+        action: PolicyAction::Tool(tool),
+        decision: PolicyVerb::Allow,
+        reason: None,
+        arg_equals: BTreeMap::new(),
+    });
 }
 
 fn policy_default_decision(input: &str) -> PolicyVerb {
@@ -429,6 +457,46 @@ mod tests {
         assert!(tools.contains("http"));
         assert!(!tools.contains("file"));
         assert!(!tools.contains("shell"));
+    }
+
+    #[test]
+    fn allowlisted_tool_bypasses_ask_user() {
+        let mut config = config_with_parent_tools(&["shell", "file"]);
+        config.policy.allowlist = vec![Arc::from("shell"), Arc::from("file")];
+
+        let policy = phase5_policy(&config, &[]);
+
+        assert_eq!(
+            policy.decide(&tool_plan("shell", json!({ "command": "ls" }))),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            policy.decide(&tool_plan(
+                "file",
+                json!({ "operation": "write", "path": "x", "content": "y" })
+            )),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn non_allowlisted_tool_still_asks_user() {
+        let mut config = config_with_parent_tools(&["shell", "file"]);
+        config.policy.allowlist = vec![Arc::from("file")];
+
+        let policy = phase5_policy(&config, &[]);
+
+        assert!(matches!(
+            policy.decide(&tool_plan("shell", json!({ "command": "ls" }))),
+            PolicyDecision::AskUser { .. }
+        ));
+        assert_eq!(
+            policy.decide(&tool_plan(
+                "file",
+                json!({ "operation": "write", "path": "x", "content": "y" })
+            )),
+            PolicyDecision::Allow
+        );
     }
 
     #[test]

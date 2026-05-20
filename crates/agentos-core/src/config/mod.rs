@@ -66,12 +66,14 @@ impl Default for AgentConfig {
 #[serde(default)]
 pub struct PolicyConfig {
     pub default: Arc<str>,
+    pub allowlist: Vec<Arc<str>>,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             default: Arc::from("deny"),
+            allowlist: Vec::new(),
         }
     }
 }
@@ -670,7 +672,7 @@ stages = [
         let config = WorkspaceConfig::load(&repo_root.join("workspace/agent.toml"))
             .expect("load workspace config");
 
-        assert_eq!(config.agent.max_turns, 16);
+        assert_eq!(config.agent.max_turns, 32);
         assert_eq!(config.policy.default.as_ref(), "deny");
         assert!(config.channels.tui.enabled);
         assert!(!config.channels.telegram.enabled);
