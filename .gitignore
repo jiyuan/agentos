@@ -38,7 +38,8 @@
 # User's files
 /workspace/*
 !/workspace/agent.toml
-#!/workspace/skills/
+!/workspace/skills/
+/workspace/skills/*
 !/workspace/skills/skill-creator/
 !/workspace/skills/audit-skill/
 !/workspace/skills/web-research/
