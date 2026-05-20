@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-prefix="${PREFIX:-$HOME/.local}"
+prefix="${PREFIX:-$HOME/.agentos}"
 bindir="${BINDIR:-$prefix/bin}"
 agentos_home="${AGENTOS_HOME:-$prefix/share/agentos}"
 from_source=0
@@ -18,7 +18,7 @@ Install AgentOS from a source checkout or a packaged release bundle.
 Options:
   --from-source       Build binaries from the current source checkout.
   --skip-build        Do not build source binaries; require existing artifacts.
-  --prefix PATH       Installation prefix. Default: ~/.local
+  --prefix PATH       Installation prefix. Default: ~/.agentos
   --bindir PATH       Binary install directory. Default: <prefix>/bin
   --home PATH         AgentOS runtime home. Default: <prefix>/share/agentos
   -h, --help          Show this help.
