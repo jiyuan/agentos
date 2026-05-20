@@ -2,7 +2,7 @@
 id = "default"
 orchestrator = "builtin.max"
 memory = "memory.in_memory"
-max_turns = 64
+max_turns = 256
 
 [policy]
 default = "deny"

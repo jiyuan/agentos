@@ -672,7 +672,7 @@ stages = [
         let config = WorkspaceConfig::load(&repo_root.join("workspace/agent.toml"))
             .expect("load workspace config");
 
-        assert_eq!(config.agent.max_turns, 64);
+        assert_eq!(config.agent.max_turns, 256);
         assert_eq!(config.policy.default.as_ref(), "deny");
         assert!(config.channels.tui.enabled);
         assert!(!config.channels.telegram.enabled);
