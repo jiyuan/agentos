@@ -140,6 +140,8 @@ if [[ ! -f "$agentos_home/.env" ]]; then
   cp "$agentos_home/.env.example" "$agentos_home/.env"
 fi
 
+cp -r "$root/workspace" "$agentos_home/"
+
 cat >"$bindir/agentos" <<EOF
 #!/usr/bin/env bash
 exec "$agentos_home/scripts/start-agentos.sh" "\$@"
